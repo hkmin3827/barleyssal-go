@@ -22,3 +22,5 @@ go.work.sum
 .vscode/
 *.swp
 *.swo
+
+prometheus.yml

@@ -16,7 +16,6 @@ type Config struct {
 
 	External ExternalConfig
 	Cache    CacheConfig
-	Mock     MockConfig
 
 	CorsOrigin string
 }
@@ -43,13 +42,10 @@ type ExternalConfig struct {
 }
 
 type CacheConfig struct {
-	PriceTTL int // seconds
-	OhlcvTTL int // seconds
+	PriceTTL int 
+	OhlcvTTL int 
 }
 
-type MockConfig struct {
-	IntervalMs int
-}
 
 func Load() *Config {
 	_ = godotenv.Load()
@@ -81,10 +77,6 @@ func Load() *Config {
 		Cache: CacheConfig{
 			PriceTTL: parseInt(os.Getenv("PRICE_CACHE_TTL"), 10),
 			OhlcvTTL: parseInt(os.Getenv("OHLCV_CACHE_TTL"), 300),
-		},
-
-		Mock: MockConfig{
-			IntervalMs: parseInt(os.Getenv("MOCK_INTERVAL_MS"), 1000),
 		},
 
 		CorsOrigin: envStr("CORS_ORIGIN", "*"),

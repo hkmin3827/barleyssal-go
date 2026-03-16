@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,8 +16,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// ExternalMarketClient connects to the KIS real-time WebSocket feed.
-// Mirrors src/shared/infrastructure/websocket/externalMarketClient.js.
 type ExternalMarketClient struct {
 	wsURL     string
 	watchList []string
@@ -31,7 +30,6 @@ type ExternalMarketClient struct {
 	stopCh   chan struct{}
 }
 
-// NewExternalMarketClient creates the KIS market client.
 func NewExternalMarketClient(
 	wsURL string,
 	watchList []string,
@@ -47,7 +45,6 @@ func NewExternalMarketClient(
 	}
 }
 
-// Start connects to KIS and begins reading market data in a goroutine.
 func (c *ExternalMarketClient) Start(ctx context.Context) error {
 	if c.wsURL == "" {
 		c.log.Error("EXTERNAL_WS_URL is not set! Cannot start KIS Client.")
@@ -64,7 +61,6 @@ func (c *ExternalMarketClient) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the KIS WebSocket connection.
 func (c *ExternalMarketClient) Stop() {
 	c.mu.Lock()
 	c.stopping = true
@@ -196,14 +192,83 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 		return
 	}
 
-	var volume int64
-	if v, err := strconv.ParseInt(strings.TrimSpace(fields[12]), 10, 64); err == nil {
-		volume = v
+	prdyVrssSign := fields[3]
+	prdyVrss, _ := strconv.ParseFloat(fields[4], 64)
+	changeRate, _ := strconv.ParseFloat(fields[5], 64)
+	wghnAvrgStckPrc, _ := strconv.ParseFloat(fields[6], 64)
+	stckOprc, _ := strconv.ParseFloat(fields[7], 64)
+	stckHgpr, _ := strconv.ParseFloat(fields[8], 64)
+	stckLwpr, _ := strconv.ParseFloat(fields[9], 64)
+	askp1, _ := strconv.ParseFloat(fields[10], 64)
+	bidp1, _ := strconv.ParseFloat(fields[11], 64)
+	cntgVol, _ := strconv.ParseFloat(fields[12], 64)
+	acmlVol, _ := strconv.ParseInt(fields[13], 10, 64)
+	cttr, _ := strconv.ParseFloat(fields[18], 64)
+
+	
+	var shnuCntgSmtn float64
+	if len(fields) > 20 {
+		shnuCntgSmtn, _ = strconv.ParseFloat(fields[20], 64)
 	}
 
-	if err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, volume); err != nil {
-		c.log.Warn("priceHook.OnPriceUpdate failed",
-			zap.String("stockCode", stockCode), zap.Error(err))
+	var selnCntgCsnu, shnuCntgCsnu float64
+	if len(fields) > 16 {
+		selnCntgCsnu, _ = strconv.ParseFloat(fields[15], 64)
+		shnuCntgCsnu, _ = strconv.ParseFloat(fields[16], 64)
 	}
-	c.hub.BroadcastPriceUpdate(stockCode, price, volume)
+
+	var ccldDvsn string
+	if shnuCntgCsnu > selnCntgCsnu {
+	ccldDvsn = "1" // 매수
+	} else {
+		ccldDvsn = "5" // 매도
+	}
+
+	mkopCode := ""
+	if len(fields) > 34 {
+		mkopCode = fields[34]
+	}
+
+	kisTimeStr := fields[1]
+	loc, _ := time.LoadLocation("Asia/Seoul")
+	nowKST := time.Now().In(loc)
+
+	fullTimeStr := fmt.Sprintf("%s%s", nowKST.Format("20060102"), kisTimeStr)
+	parsedTimeKST, _ := time.ParseInLocation("20060102150405", fullTimeStr, loc)
+
+	utcTime := parsedTimeKST.UTC()
+
+	if err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, changeRate, acmlVol, utcTime); err != nil {
+			c.log.Warn("priceHook.OnPriceUpdate failed", zap.String("stockCode", stockCode), zap.Error(err))
+	}
+
+	if shnuCntgSmtn > 0 {
+		c.priceHook.UpdateBuyVolume(ctx, stockCode, shnuCntgSmtn)
+	}
+
+	tickData := map[string]interface{}{
+	"type":            "PRICE_UPDATE",
+	"stockCode":       stockCode,
+	"price":           price,
+	"prdyVrssSign":    prdyVrssSign,
+	"prdyVrss":        prdyVrss,
+	"prdyCtrt":        changeRate,
+	"wghnAvrgStckPrc": wghnAvrgStckPrc,
+	"stckOprc":        stckOprc,
+	"stckHgpr":        stckHgpr,
+	"stckLwpr":        stckLwpr,
+	"askp1":           askp1,
+	"bidp1":           bidp1,
+	"cntgVol":         cntgVol,
+	"acmlVol":         acmlVol,
+	"cttr":            cttr,
+	"selnCntgCsnu":    selnCntgCsnu,
+	"shnuCntgCsnu":    shnuCntgCsnu,
+	"ccldDvsn":        ccldDvsn,
+	"mkopCode":        mkopCode,
+	"shnuCntgSmtn":    shnuCntgSmtn, 
+	"ts":              utcTime.UnixMilli(),
+	}
+
+	c.hub.BroadcastPriceUpdate(stockCode, tickData)
 }

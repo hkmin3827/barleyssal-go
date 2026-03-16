@@ -1,5 +1,3 @@
-// Package websocket implements the internal WebSocket hub.
-// It mirrors src/shared/infrastructure/websocket/wsServer.js exactly.
 package websocket
 
 import (
@@ -16,11 +14,6 @@ import (
 	"barleyssal-go/shared/ports"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────────────────────────────────────
-
-// clientMeta holds per-connection subscription state (mirrors ClientMeta typedef).
 type clientMeta struct {
 	mu                sync.Mutex
 	userID            string
@@ -50,6 +43,8 @@ type Hub struct {
 	// priceClients: stockCode → set of *client
 	priceClients map[string]map[*client]struct{}
 
+	allClients map[*client]struct{}
+
 	connCount int64 // atomic
 }
 
@@ -62,11 +57,6 @@ type client struct {
 	log  *zap.Logger
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constructor & Setup
-// ─────────────────────────────────────────────────────────────────────────────
-
-// NewHub creates a new Hub.
 func NewHub(log *zap.Logger) *Hub {
 	h := &Hub{
 		log: log,
@@ -77,18 +67,14 @@ func NewHub(log *zap.Logger) *Hub {
 		},
 		userClients:  make(map[string]map[*client]struct{}),
 		priceClients: make(map[string]map[*client]struct{}),
+		allClients:   make(map[*client]struct{}),
 	}
 	return h
 }
 
-// SetPnlService injects the PnL service (avoids circular dependency at construction time).
 func (h *Hub) SetPnlService(svc ports.PnlSubscriptionService) {
 	h.pnlSvc = svc
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP handler — called by Echo router at GET /ws
-// ─────────────────────────────────────────────────────────────────────────────
 
 // ServeHTTP upgrades the HTTP connection and runs the client loop.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +92,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log:  h.log,
 	}
 
+	h.mu.Lock()
+	h.allClients[c] = struct{}{}
+	h.mu.Unlock()
+
 	atomic.AddInt64(&h.connCount, 1)
 	h.log.Info("WS client connected",
 		zap.String("remoteAddr", r.RemoteAddr),
@@ -118,10 +108,6 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	atomic.AddInt64(&h.connCount, -1)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// readPump / writePump
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (c *client) readPump() {
 	defer func() {
@@ -186,10 +172,6 @@ func (c *client) sendJSON(v interface{}) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// handleMessage — mirrors handleMessage switch
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (h *Hub) handleMessage(c *client, raw []byte) {
 	var msg incomingMsg
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -225,7 +207,6 @@ func (h *Hub) handleSubscribePrice(c *client, symbols []string) {
 	c.meta.mu.Lock()
 	defer c.meta.mu.Unlock()
 
-	// Remove old subscriptions
 	h.mu.Lock()
 	for code := range c.meta.subscribedSymbols {
 		if s := h.priceClients[code]; s != nil {
@@ -236,7 +217,6 @@ func (h *Hub) handleSubscribePrice(c *client, symbols []string) {
 		}
 	}
 
-	// Add new subscriptions
 	c.meta.subscribedSymbols = make(map[string]struct{}, len(symbols))
 	for _, code := range symbols {
 		if h.priceClients[code] == nil {
@@ -256,7 +236,6 @@ func (h *Hub) handleSubscribeAccount(c *client, userID string) {
 	c.meta.mu.Lock()
 	oldUserID := c.meta.userID
 
-	// Detach from old user subscription
 	if oldUserID != "" {
 		h.mu.Lock()
 		if s := h.userClients[oldUserID]; s != nil {
@@ -271,7 +250,6 @@ func (h *Hub) handleSubscribeAccount(c *client, userID string) {
 		}
 	}
 
-	// Attach to new user
 	c.meta.userID = userID
 	c.meta.mu.Unlock()
 
@@ -294,10 +272,6 @@ func (h *Hub) handleSubscribeAccount(c *client, userID string) {
 		"type": "SUBSCRIBED_ACCOUNT", "userId": userID, "ts": nowMS(),
 	})
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// disconnect — mirrors handleDisconnect
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Hub) disconnect(c *client) {
 	c.meta.mu.Lock()
@@ -325,6 +299,8 @@ func (h *Hub) disconnect(c *client) {
 			}
 		}
 	}
+
+	delete(h.allClients, c)
 	h.mu.Unlock()
 
 	if userID != "" && h.pnlSvc != nil {
@@ -334,27 +310,17 @@ func (h *Hub) disconnect(c *client) {
 	close(c.send)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ports.UserNotifier implementation
-// ─────────────────────────────────────────────────────────────────────────────
-
 // BroadcastPriceUpdate sends a PRICE_UPDATE to all price-subscribed clients for stockCode.
-func (h *Hub) BroadcastPriceUpdate(stockCode string, price float64, volume int64) {
+func (h *Hub) BroadcastPriceUpdate(stockCode string, tickData map[string]interface{}) {
+	payload, _ := json.Marshal(tickData)
+
 	h.mu.RLock()
 	clients := copyClientSet(h.priceClients[stockCode])
 	h.mu.RUnlock()
 
-	if len(clients) == 0 {
+		if len(clients) == 0 {
 		return
 	}
-
-	payload, _ := json.Marshal(map[string]interface{}{
-		"type":      "PRICE_UPDATE",
-		"stockCode": stockCode,
-		"price":     price,
-		"volume":    volume,
-		"ts":        nowMS(),
-	})
 
 	for c := range clients {
 		select {
@@ -364,6 +330,21 @@ func (h *Hub) BroadcastPriceUpdate(stockCode string, price float64, volume int64
 	}
 }
 
+func (h *Hub) BroadcastToAll(payload []byte) {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+
+		clients := copyClientSet(h.allClients)
+
+    // 모든 클라이언트(clients)에게 전송
+    for c := range clients {
+        select {
+        case c.send <- payload:
+        default:
+            // 전송 실패 시 처리 (저사양 EC2이므로 버퍼가 차면 무시하는 전략)
+        }
+    }
+}
 // PushToUser sends an arbitrary JSON payload to all WS connections for userId.
 func (h *Hub) PushToUser(userID string, data interface{}) {
 	h.mu.RLock()
@@ -387,7 +368,6 @@ func (h *Hub) PushToUser(userID string, data interface{}) {
 	}
 }
 
-// NotifyExecution sends an EXECUTION event to the user and schedules a PnL refresh.
 func (h *Hub) NotifyExecution(data interface{}) {
 	m, ok := data.(map[string]interface{})
 	if !ok {
@@ -416,10 +396,6 @@ func (h *Hub) NotifyExecution(data interface{}) {
 func (h *Hub) GetConnectedCount() int {
 	return int(atomic.LoadInt64(&h.connCount))
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 func copyClientSet(s map[*client]struct{}) map[*client]struct{} {
 	cp := make(map[*client]struct{}, len(s))

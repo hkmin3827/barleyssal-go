@@ -1,10 +1,15 @@
 package ports
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
 
 type UserNotifier interface {
 	PushToUser(userID string, data interface{})
-	BroadcastPriceUpdate(stockCode string, price float64, volume int64)
+	BroadcastPriceUpdate(stockCode string, tickData map[string]interface{})
+	BroadcastToAll(payload []byte)
 	NotifyExecution(data interface{})
 	GetConnectedCount() int
 }
@@ -17,5 +22,6 @@ type PnlSubscriptionService interface {
 }
 
 type PriceEventHandler interface {
-	OnPriceUpdate(ctx context.Context, stockCode string, price float64, volume int64) error
+	OnPriceUpdate(ctx context.Context, stockCode string, price float64, changeRate float64, volume int64, eventTime time.Time) error
+	UpdateBuyVolume(ctx context.Context, stockCode string, shnuCntgSmtn float64)
 }

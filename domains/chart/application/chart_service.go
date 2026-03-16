@@ -1,5 +1,3 @@
-// Package chartapplication handles intraday OHLCV buffering and period chart fetching.
-// It mirrors src/domains/chart/application/chartService.js exactly.
 package chartapplication
 
 import (
@@ -35,11 +33,11 @@ type OhlcvBar struct {
 	Low    float64
 	Close  float64
 	Volume float64
-	Minute string // YYYYMMDDHHmm
+	Minute string
 }
 
 type OhlcvBarJSON struct {
-	T string  `json:"t"` // YYYYMMDDHHmm
+	T string  `json:"t"`
 	O float64 `json:"o"`
 	H float64 `json:"h"`
 	L float64 `json:"l"`
@@ -54,12 +52,8 @@ type OhlcvEntry struct {
 	L         float64 `json:"l"`
 	C         float64 `json:"c"`
 	V         float64 `json:"v"`
-	Timestamp int64   `json:"timestamp"` // Unix ms (KST)
+	Timestamp int64   `json:"timestamp"`
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Service
-// ─────────────────────────────────────────────────────────────────────────────
 
 type ChartService struct {
 	cfg        *config.Config
@@ -68,7 +62,6 @@ type ChartService struct {
 	restClient *utils.KisRestClient
 	log        *zap.Logger
 
-	// 분봉 OHLCV 인메모리 버퍼 (stockCode → OhlcvBar)
 	bufMu  sync.RWMutex
 	buffer map[string]*OhlcvBar
 }
@@ -94,11 +87,6 @@ func ohlcvKey(code, tf string) string {
 	return fmt.Sprintf("market:ohlcv:%s:%s", tf, code)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Period chart (KIS REST API)  — mirrors getPeriodChartData
-// ─────────────────────────────────────────────────────────────────────────────
-
-// GetPeriodChartData calls the KIS REST API for daily/weekly/monthly/yearly candles.
 func (s *ChartService) GetPeriodChartData(ctx context.Context, stockCode, period, startDate, endDate string) ([]ChartData, error) {
 	token, err := s.authSvc.GetAccessToken(ctx)
 	if err != nil || token == "" {
@@ -122,7 +110,7 @@ func (s *ChartService) GetPeriodChartData(ctx context.Context, stockCode, period
 	data, err := s.restClient.FetchKisAPI(ctx, url, headers)
 	if err != nil {
 		return nil, fmt.Errorf("KIS API 호출 실패: %w", err)
-	}
+	}	
 
 	if rtCd, _ := data["rt_cd"].(string); rtCd != "0" {
 		msg, _ := data["msg1"].(string)
@@ -134,14 +122,34 @@ func (s *ChartService) GetPeriodChartData(ctx context.Context, stockCode, period
 		return nil, fmt.Errorf("KIS API: output2 배열 없음")
 	}
 
+
 	chartList := make([]ChartData, 0, len(output2))
+
+	loc, _ := time.LoadLocation("Asia/Seoul")
+	if loc == nil {
+		loc = time.FixedZone("KST", 9*60*60)
+	}
+
 	for _, item := range output2 {
 		m, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
+
+		dateRaw := strVal(m, "stck_bsop_date")
+		parsedTime, err := time.ParseInLocation("20060102", dateRaw, loc)
+
+		var finalDate string
+		if err == nil {
+			// 3. 파싱된 시간을 표준 UTC로 변환한 뒤 YYYY-MM-DD 형식으로 포맷팅
+			// 일봉 차트에서 lightweight-charts는 'YYYY-MM-DD' 형식을 매우 잘 인식합니다.
+			finalDate = parsedTime.Format("2006-01-02")
+		} else {
+			finalDate = dateRaw // 파싱 실패 시 원본이라도 유지
+		}
+
 		chartList = append(chartList, ChartData{
-			Date:   strVal(m, "stck_bsop_date"),
+			Date:   finalDate,
 			Open:   parseFloat(strVal(m, "stck_oprc")),
 			High:   parseFloat(strVal(m, "stck_hgpr")),
 			Low:    parseFloat(strVal(m, "stck_lwpr")),
@@ -245,11 +253,6 @@ func (s *ChartService) GetOhlcv(ctx context.Context, stockCode, timeframe string
 // formatBarsForFrontend adds Unix-ms timestamps (KST) to each bar.
 // Mirrors the inner formatBarsForFrontend closure in chartService.js.
 func formatBarsForFrontend(bars []OhlcvBarJSON) []OhlcvEntry {
-	loc, _ := time.LoadLocation("Asia/Seoul")
-	if loc == nil {
-		loc = time.FixedZone("KST", 9*60*60)
-	}
-
 	entries := make([]OhlcvEntry, 0, len(bars))
 	for _, bar := range bars {
 		t := bar.T
@@ -262,7 +265,8 @@ func formatBarsForFrontend(bars []OhlcvBarJSON) []OhlcvEntry {
 		h, _ := strconv.Atoi(t[8:10])
 		mi, _ := strconv.Atoi(t[10:12])
 
-		ts := time.Date(y, time.Month(mo), d, h, mi, 0, 0, loc).UnixMilli()
+		ts := time.Date(y, time.Month(mo), d, h, mi, 0, 0, time.UTC).UnixMilli()
+
 
 		entries = append(entries, OhlcvEntry{
 			T: bar.T, O: bar.O, H: bar.H, L: bar.L, C: bar.C, V: bar.V,
@@ -279,9 +283,8 @@ func formatBarsForFrontend(bars []OhlcvBarJSON) []OhlcvEntry {
 // UpdateOhlcvBuffer is called on each price tick. It accumulates into the
 // in-memory 1-minute bar and flushes the completed bar to the Redis pipeline.
 // The caller must call pipeline.Exec() after this returns.
-func (s *ChartService) UpdateOhlcvBuffer(ctx context.Context, stockCode string, price, volume float64, pipe redis.Pipeliner) {
-	now := time.Now()
-	minute := utils.BuildMinuteKey(now)
+func (s *ChartService) UpdateOhlcvBuffer(ctx context.Context, stockCode string, price, volume float64, pipe redis.Pipeliner, eventTime time.Time) {
+	minute := utils.BuildMinuteKey(eventTime)
 
 	s.bufMu.Lock()
 	defer s.bufMu.Unlock()
@@ -289,7 +292,6 @@ func (s *ChartService) UpdateOhlcvBuffer(ctx context.Context, stockCode string, 
 	bar, exists := s.buffer[stockCode]
 
 	if !exists || bar.Minute != minute {
-		// Flush completed bar to Redis before starting new one
 		if exists && bar != nil {
 			s.flushOhlcvBar(ctx, stockCode, bar, pipe)
 		}

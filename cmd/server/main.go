@@ -22,6 +22,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
@@ -39,7 +40,6 @@ func main() {
 		DB:       cfg.Redis.DB,
 	})
 
-	// Wait for Redis to be ready (mirrors index.js retry loop)
 	ctx := context.Background()
 	for i := 0; i < 10; i++ {
 		if err := rdb.Ping(ctx).Err(); err == nil {
@@ -64,20 +64,14 @@ func main() {
 	// ── Dependency wiring ────────────────────────────────────────────────────
 	hub := wshub.NewHub(log)
 
-	// 2. Create PnlService with Hub as its notifier
 	pnlSvc := pnlapp.New(rdb, hub, log)
-
-	// 3. Inject PnlService back into Hub
 	hub.SetPnlService(pnlSvc)
 
-	// 4. MatchingEngine
 	matchEng := matchingapp.New(cfg, rdb, execProducer, hub, log)
 
-	// 5. ChartService
 	kisRestClient := utils.NewKisRestClient(log)
 	chartSvc := chartapp.New(cfg, rdb, authSvc, kisRestClient, log)
 
-	// 6. PriceService (ties everything together)
 	priceSvc := price.New(cfg, rdb, chartSvc, matchEng, pnlSvc, log)
 
 	// ── Register stocks in Redis ─────────────────────────────────────────────
@@ -109,7 +103,7 @@ func main() {
 		cfg.External.WsURL,
 		watchCodes,
 		authSvc,
-		priceSvc, // implements ports.PriceEventHandler
+		priceSvc, 
 		hub,
 		log,
 	)
@@ -119,31 +113,29 @@ func main() {
 
 	// ── 실시간 랭킹 브로드캐스트 스케줄러 ──
 go func() {
-	ticker := time.NewTicker(2 * time.Second) // 2초 주기로 실행 (서버 부하 및 프론트 렌더링 최적화)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-cancelCtx.Done(): // 메인 서버 종료 시 스케줄러도 함께 안전하게 종료
+		case <-cancelCtx.Done():
 			return
 		case <-ticker.C:
-			// 빈 검색어("")로 호출 시 거래량(ZSET Score) 상위 40개 반환
 			ranking, err := priceSvc.SearchStocks(context.Background(), "", 40)
 			if err != nil {
 				log.Warn("실시간 랭킹 조회 실패", zap.Error(err))
 				continue
 			}
 
-			// 프론트엔드에서 데이터 종류를 식별할 수 있도록 type 필드 추가
 			msg := map[string]interface{}{
 				"type": "ranking",
 				"data": ranking,
+				"ts":   time.Now().UnixMilli(),
 			}
 
 			msgBytes, err := json.Marshal(msg)
 			if err == nil {
-				// Hub의 Broadcast 채널로 전송 (Hub 내부 구현에 따라 메서드명은 다를 수 있음)
-				hub.Broadcast <- msgBytes 
+				hub.BroadcastToAll(msgBytes)
 			}
 		}
 	}
@@ -153,6 +145,9 @@ go func() {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
+
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
+
 	e.Use(middleware.Recover())
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins:     []string{cfg.CorsOrigin},
@@ -172,7 +167,7 @@ go func() {
 	}
 
 	go func() {
-		log.Info("✅ Go Market Gateway started",
+		log.Info("✅ Go Market Gateway & Metrics started",
 			zap.Int("port", cfg.Port),
 			zap.String("ws", fmt.Sprintf("ws://localhost:%d/ws", cfg.Port)),
 			zap.String("rest", fmt.Sprintf("http://localhost:%d/api/market", cfg.Port)),
