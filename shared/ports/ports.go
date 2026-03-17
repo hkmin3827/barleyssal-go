@@ -22,6 +22,18 @@ type PnlSubscriptionService interface {
 }
 
 type PriceEventHandler interface {
-	OnPriceUpdate(ctx context.Context, stockCode string, price float64, changeRate float64, volume int64, eventTime time.Time) error
+		OnPriceUpdate(
+		ctx       context.Context,
+		stockCode string,
+		price     float64,
+		changeRate float64,
+		volume    int64,
+		prdyVrss  float64,
+		stckOprc  float64,
+		stckHgpr  float64,
+		stckLwpr  float64,
+		acmlVol   int64,
+		eventTime time.Time,
+	) error
 	UpdateBuyVolume(ctx context.Context, stockCode string, shnuCntgSmtn float64)
 }

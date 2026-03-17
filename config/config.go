@@ -44,6 +44,7 @@ type ExternalConfig struct {
 type CacheConfig struct {
 	PriceTTL int 
 	OhlcvTTL int 
+	InfoTTL int
 }
 
 
@@ -76,7 +77,8 @@ func Load() *Config {
 
 		Cache: CacheConfig{
 			PriceTTL: parseInt(os.Getenv("PRICE_CACHE_TTL"), 10),
-			OhlcvTTL: parseInt(os.Getenv("OHLCV_CACHE_TTL"), 300),
+			OhlcvTTL: parseInt(os.Getenv("OHLCV_CACHE_TTL"), 604800),
+			InfoTTL: parseInt(os.Getenv("INFO_CACHE_TTL"), 604800),
 		},
 
 		CorsOrigin: envStr("CORS_ORIGIN", "*"),

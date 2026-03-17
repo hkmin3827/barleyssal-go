@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"barleyssal-go/config"
+	"barleyssal-go/shared/utils"
 
 	"go.uber.org/zap"
 
@@ -31,7 +32,7 @@ type OrderRequestEvent struct {
 	OrderType  string `json:"orderType"`
 	Quantity   string `json:"quantity"`
 	LimitPrice string `json:"limitPrice"`
-	Timestamp  string `json:"timestamp"`
+	Timestamp  int64 `json:"timestamp"`
 }
 
 // OrderHandler is called for each successfully parsed order event.
@@ -43,7 +44,7 @@ type DLQMessage struct {
 	Payload       string `json:"payload"`
 	ErrorType     string `json:"errorType"`
 	ErrorMessage  string `json:"errorMessage"`
-	Timestamp     string `json:"timestamp"`
+	Timestamp     int64 `json:"timestamp"`
 }
 
 // OrderConsumer wraps a kafka-go Reader for the order.request topic.
@@ -149,7 +150,7 @@ func (c *OrderConsumer) sendToDLQ(ctx context.Context, originalTopic, payload, e
 		Payload:       payload,
 		ErrorType:     errType,
 		ErrorMessage:  errMsg,
-		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+		Timestamp:      utils.NowMillis(),
 	}
 	data, _ := json.Marshal(dlq)
 	if err := c.dlqWriter.WriteMessages(ctx, kfkgo.Message{Value: data}); err != nil {

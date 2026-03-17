@@ -1,5 +1,4 @@
 // Package pnlapplication computes real-time PnL and pushes results over WebSocket.
-// Business logic is ported 1:1 from src/domains/pnl/application/pnlService.js.
 package pnlapplication
 
 import (
@@ -17,36 +16,34 @@ import (
 	"go.uber.org/zap"
 )
 
-// HoldingMeta mirrors the Redis-stored JSON in account:holdings:meta:{userId}.
 type HoldingMeta struct {
 	AvgPrice      string `json:"avgPrice"`
 	TotalQuantity string `json:"totalQuantity"`
 }
 
-// HoldingDetail is the per-stock PnL record sent to the frontend.
 type HoldingDetail struct {
 	StockCode     string  `json:"stockCode"`
 	TotalQuantity int64   `json:"totalQuantity"`
 	AvgPrice      float64 `json:"avgPrice"`
 	CurrentPrice  float64 `json:"currentPrice"`
 	HoldValue     float64 `json:"holdValue"`
-	PnlRate       float64 `json:"pnlRate"`
+	PnlAmount     float64 `json:"pnlAmount"`  // (currentPrice - avgPrice) * qty
+	PnlRate       float64 `json:"pnlRate"`    // % 수익률
 }
 
-// PnlUpdatePayload is the WebSocket message sent to the user (PNL_UPDATE).
 type PnlUpdatePayload struct {
 	Type                string          `json:"type"`
 	UserID              string          `json:"userId"`
 	Deposit             float64         `json:"deposit"`
 	Principal           float64         `json:"principal"`
-	StockValue          float64         `json:"stockValue"`
-	RealtimeTotalEquity float64         `json:"realtimeTotalEquity"`
-	TotalPnlRate        float64         `json:"totalPnlRate"`
+	StockValue          float64         `json:"stockValue"`          // 보유 주식 평가금액 합계
+	RealtimeTotalEquity float64         `json:"realtimeTotalEquity"` // deposit + stockValue
+	TotalPnlAmount      float64         `json:"totalPnlAmount"`      // 주식 평가손익 합계 (원금 차이 아님)
+	TotalPnlRate        float64         `json:"totalPnlRate"`        // 전체 수익률 (원금 기준)
 	Holdings            []HoldingDetail `json:"holdings"`
 	Ts                  int64           `json:"ts"`
 }
 
-// PnlService manages per-user PnL subscriptions and calculations.
 type PnlService struct {
 	rdb      *redis.Client
 	notifier ports.UserNotifier
@@ -57,7 +54,6 @@ type PnlService struct {
 	userHoldings     map[string]map[string]struct{} // userId    -> set of stockCodes
 }
 
-// New creates a new PnlService.
 func New(rdb *redis.Client, notifier ports.UserNotifier, log *zap.Logger) *PnlService {
 	return &PnlService{
 		rdb:              rdb,
@@ -68,7 +64,6 @@ func New(rdb *redis.Client, notifier ports.UserNotifier, log *zap.Logger) *PnlSe
 	}
 }
 
-// SubscribeUser loads the user's holdings from Redis and registers price subscriptions.
 func (s *PnlService) SubscribeUser(ctx context.Context, userID string) error {
 	holdings, err := s.rdb.HGetAll(ctx, "account:holdings:"+userID).Result()
 	if err != nil {
@@ -96,6 +91,15 @@ func (s *PnlService) SubscribeUser(ctx context.Context, userID string) error {
 		codeList = append(codeList, c)
 	}
 	s.log.Debug("PnL subscription registered", zap.String("userId", userID), zap.Strings("codes", codeList))
+
+	// 즉시 초기 스냅샷 전송: triggerCode = "" 이면 calcAndPush가
+	// 모든 종목 가격을 Redis에서 조회하여 PNL_UPDATE를 바로 전송한다.
+	go func() {
+		if err := s.calcAndPush(context.Background(), userID, 0, ""); err != nil {
+			s.log.Warn("initial PNL snapshot failed", zap.String("userId", userID), zap.Error(err))
+		}
+	}()
+
 	return nil
 }
 
@@ -114,13 +118,11 @@ func (s *PnlService) UnsubscribeUser(userID string) {
 	delete(s.userHoldings, userID)
 }
 
-// RefreshUserSubscription unsubscribes then re-subscribes.
 func (s *PnlService) RefreshUserSubscription(ctx context.Context, userID string) error {
 	s.UnsubscribeUser(userID)
 	return s.SubscribeUser(ctx, userID)
 }
 
-// OnPriceUpdate triggers PnL recalculation for all users subscribed to the stock.
 func (s *PnlService) OnPriceUpdate(stockCode string, currentPrice float64) {
 	s.mu.RLock()
 	subs := s.stockSubscribers[stockCode]
@@ -145,8 +147,6 @@ func (s *PnlService) OnPriceUpdate(stockCode string, currentPrice float64) {
 	}
 }
 
-// calcAndPush computes PnL for a user and pushes a PNL_UPDATE message over WebSocket.
-// This mirrors calcAndPush in pnlService.js exactly.
 func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPrice float64, triggerCode string) error {
 	status, err := s.rdb.HGetAll(ctx, "account:status:"+userID).Result()
 	if err != nil || status["deposit"] == "" || status["principal"] == "" {
@@ -162,6 +162,7 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 	}
 
 	var stockValue float64
+	var totalPnlAmount float64
 	holdingDetails := make([]HoldingDetail, 0, len(holdingsMeta))
 
 	for code, metaStr := range holdingsMeta {
@@ -180,6 +181,7 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		} else {
 			priceStr, err := s.rdb.Get(ctx, "market:price:"+code).Result()
 			if err != nil || priceStr == "" {
+				// Redis에 시세 없으면 평단가로 대체 (손익 0으로 표시)
 				avgP, _ := strconv.ParseFloat(meta.AvgPrice, 64)
 				currentPrice = avgP
 			} else {
@@ -190,23 +192,32 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		avgPrice, _ := strconv.ParseFloat(meta.AvgPrice, 64)
 		holdValue := currentPrice * float64(totalQty)
 
+		// 종목별 평가손익 = (현재가 - 평단가) × 수량
+		pnlAmount := (currentPrice - avgPrice) * float64(totalQty)
+
 		var pnlRate float64
 		if avgPrice > 0 {
 			pnlRate = ((currentPrice - avgPrice) / avgPrice) * 100
 		}
 
 		stockValue += holdValue
+		totalPnlAmount += pnlAmount
+
 		holdingDetails = append(holdingDetails, HoldingDetail{
 			StockCode:     code,
 			TotalQuantity: totalQty,
 			AvgPrice:      avgPrice,
 			CurrentPrice:  currentPrice,
 			HoldValue:     holdValue,
+			PnlAmount:     math.Round(pnlAmount*100) / 100,
 			PnlRate:       math.Round(pnlRate*100) / 100,
 		})
 	}
 
+	// 총 자산 = 예수금 + 주식 평가금액
 	realtimeTotalEquity := deposit + stockValue
+
+	// 전체 수익률: 원금 기준 (예수금+평가금 vs 원금)
 	var totalPnlRate float64
 	if principal > 0 {
 		totalPnlRate = ((realtimeTotalEquity - principal) / principal) * 100
@@ -217,8 +228,9 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		UserID:              userID,
 		Deposit:             deposit,
 		Principal:           principal,
-		StockValue:          stockValue,
+		StockValue:          math.Round(stockValue*100) / 100,
 		RealtimeTotalEquity: math.Round(realtimeTotalEquity*100) / 100,
+		TotalPnlAmount:      math.Round(totalPnlAmount*100) / 100, // 주식 평가손익만
 		TotalPnlRate:        math.Round(totalPnlRate*100) / 100,
 		Holdings:            holdingDetails,
 		Ts:                  time.Now().UnixMilli(),

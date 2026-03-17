@@ -65,7 +65,7 @@ func (p *ExecutionProducer) PublishExecutionEvent(ctx context.Context, params ma
 		"orderSide":        params.OrderSide,
 		"executedQuantity": params.ExecutedQty,
 		"executedPrice":    params.ExecutedPrice,
-		"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		"timestamp":       time.Now().UnixMilli(),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

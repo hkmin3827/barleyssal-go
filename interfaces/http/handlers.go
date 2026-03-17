@@ -42,14 +42,76 @@ func (h *Handler) RegisterRoutes(e *echo.Echo) {
 	chart.GET("/intraday/:stockCode", h.getIntraDayChart)
 
 	market := e.Group("/api/market")
-	market.GET("/price/:stockCode", h.getPrice)
-	market.POST("/prices/batch", h.getBatchPrices)
 	market.GET("/search", h.searchStocks)
 	market.GET("/account/pnl/:userId", h.getAccountPnl)
+
+	e.GET("/api/stocks", h.getSortedStocks)  // stocksPage 정렬
+
+	e.GET("/api/stocks/info/:code", h.getStockInfo)  // stockDetailPage 초기 seed
 
 	e.GET("/api/health", h.health)
 	e.GET("/ws", echo.WrapHandler(h.hub))
 }
+
+func (h *Handler) getSortedStocks(c echo.Context) error {
+	sortKey := c.QueryParam("sort")
+	if sortKey == "" {
+		sortKey = "changeRate"
+	}
+ 
+	if sortKey == "name" {
+		return c.JSON(http.StatusBadRequest, echo.Map{
+			"error": "name sort is handled by frontend using stocks.js",
+		})
+	}
+ 
+	if sortKey != "changeRate" && sortKey != "acmlVol" {
+		return c.JSON(http.StatusBadRequest, echo.Map{
+			"error": "sort must be one of: changeRate, acmlVol",
+		})
+	}
+ 
+	stocks, err := h.priceSvc.GetSortedStocks(c.Request().Context(), sortKey)
+	if err != nil {
+		h.log.Warn("getSortedStocks failed", zap.String("sort", sortKey), zap.Error(err))
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "sort failed"})
+	}
+ 
+	return c.JSON(http.StatusOK, echo.Map{
+		"sort":   sortKey,
+		"stocks": stocks,
+	})
+}
+
+func (h *Handler) getStockInfo(c echo.Context) error {
+	code := strings.ToUpper(c.Param("code"))
+	if code == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "stock code required"})
+	}
+ 
+	info, err := h.priceSvc.GetStockInfo(c.Request().Context(), code)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "info fetch failed"})
+	}
+ 
+	if info["price"] == 0 {
+		return c.JSON(http.StatusNotFound, echo.Map{"error": "price not available yet"})
+	}
+ 
+	return c.JSON(http.StatusOK, echo.Map{
+		"stockCode":  code,
+		"price":      info["price"],
+		"changeRate": info["changeRate"],
+		"prdyVrss":   info["prdyVrss"],
+		"stckOprc":   info["stckOprc"],
+		"stckHgpr":   info["stckHgpr"],
+		"stckLwpr":   info["stckLwpr"],
+		"volume": info["volume"],  // 체결 거래량 (cntg_vol)
+		"acmlVol":    int64(info["acmlVol"]),
+		"ts":         time.Now().UnixMilli(),
+	})
+}
+ 
 
 func (h *Handler) getPeriodChart(c echo.Context) error {
 	stockCode := strings.ToUpper(c.Param("stockCode"))
@@ -91,36 +153,7 @@ func (h *Handler) getIntraDayChart(c echo.Context) error {
 	return c.JSON(http.StatusOK, echo.Map{"success": true, "data": data})
 }
 
-func (h *Handler) getPrice(c echo.Context) error {
-	code := strings.ToUpper(c.Param("stockCode"))
-	p, err := h.priceSvc.GetCurrentPrice(c.Request().Context(), code)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "internal error"})
-	}
-	if p == nil {
-		return c.JSON(http.StatusNotFound, echo.Map{"error": "Price not available"})
-	}
-	return c.JSON(http.StatusOK, echo.Map{"stockCode": code, "price": *p, "ts": time.Now().UnixMilli()})
-}
 
-func (h *Handler) getBatchPrices(c echo.Context) error {
-	var req struct {
-		Symbols []string `json:"symbols"`
-	}
-	if err := c.Bind(&req); err != nil || len(req.Symbols) == 0 || len(req.Symbols) > 100 {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": "symbols must be array, max 100"})
-	}
-	type entry struct {
-		StockCode string   `json:"stockCode"`
-		Price     *float64 `json:"price"`
-	}
-	result := make([]entry, 0, len(req.Symbols))
-	for _, s := range req.Symbols {
-		p, _ := h.priceSvc.GetCurrentPrice(c.Request().Context(), s)
-		result = append(result, entry{StockCode: s, Price: p})
-	}
-	return c.JSON(http.StatusOK, echo.Map{"prices": result})
-}
 
 func (h *Handler) searchStocks(c echo.Context) error {
 	q := c.QueryParam("q")

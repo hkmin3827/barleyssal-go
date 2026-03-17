@@ -10,8 +10,8 @@ func FormatYYYYMMDD(t time.Time) string {
 }
 
 type ChartDateRange struct {
-	StartDate string // YYYYMMDD
-	EndDate   string // YYYYMMDD
+	StartDate string 
+	EndDate   string
 }
 
 func GetChartDateRange(period string) ChartDateRange {

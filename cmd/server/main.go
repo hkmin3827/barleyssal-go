@@ -79,7 +79,7 @@ func main() {
 	if err := priceSvc.RegisterStocks(ctx, watchCodes); err != nil {
 		log.Warn("registerStocks failed", zap.Error(err))
 	}
-
+	
 	// ── Kafka Order Consumer ─────────────────────────────────────────────────
 	orderConsumer := orderkafka.NewOrderConsumer(cfg, func(ctx context.Context, ev orderkafka.OrderRequestEvent) error {
 		return matchEng.OnOrderReceived(ctx, matchingapp.OrderEvent{
@@ -121,18 +121,34 @@ go func() {
 		case <-cancelCtx.Done():
 			return
 		case <-ticker.C:
-			ranking, err := priceSvc.SearchStocks(context.Background(), "", 40)
+			broadcastCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+			// 1. 당일 등락률 상위 10개 (홈페이지 "최고 상승률" 퀵스탯 + 등락률 랭킹)
+			topChangeRate, err := priceSvc.GetTopChangeRate(broadcastCtx, 10)
 			if err != nil {
-				log.Warn("실시간 랭킹 조회 실패", zap.Error(err))
+				log.Warn("GetTopChangeRate 실패", zap.Error(err))
+				cancel()
 				continue
 			}
 
-			msg := map[string]interface{}{
-				"type": "ranking",
-				"data": ranking,
-				"ts":   time.Now().UnixMilli(),
+			// 2. 인기 매매 비중 상위 10개 (홈페이지 파이차트)
+			//    비중(%)이 계산되어 RankingItem.BuyVolPct에 저장됨
+			topBuyVol, err := priceSvc.GetTopBuyVolume(broadcastCtx, 10)
+			if err != nil {
+				log.Warn("GetTopBuyVolume 실패", zap.Error(err))
+				cancel()
+				continue
 			}
 
+			cancel()
+
+				msg := map[string]interface{}{
+					"type":          "home_update",
+					"topChangeRate": topChangeRate, // 등락률 TOP 10
+					"topBuyVolume":  topBuyVol,     // 매수 비중 TOP 10 (BuyVolPct 포함)
+					"ts":            time.Now().UnixMilli(),
+				}
+ 
 			msgBytes, err := json.Marshal(msg)
 			if err == nil {
 				hub.BroadcastToAll(msgBytes)
@@ -153,7 +169,7 @@ go func() {
 		AllowOrigins:     []string{cfg.CorsOrigin},
 		AllowCredentials: true,
 	}))
-	// Rate limit ~1000 req / 15 min per IP  (70 req/s sustained)
+
 	e.Use(middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(70)))
 
 	httphandler.New(chartSvc, priceSvc, rdb, hub, log).RegisterRoutes(e)
@@ -177,6 +193,8 @@ go func() {
 		}
 	}()
 
+
+
 	// ── Graceful Shutdown ────────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
@@ -196,3 +214,4 @@ go func() {
 
 	log.Info("Shutdown complete")
 }
+
