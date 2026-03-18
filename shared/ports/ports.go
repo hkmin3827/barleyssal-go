@@ -28,12 +28,14 @@ type PriceEventHandler interface {
 		price     float64,
 		changeRate float64,
 		volume    int64,
+		prdyVrssSign int64,
 		prdyVrss  float64,
 		stckOprc  float64,
 		stckHgpr  float64,
 		stckLwpr  float64,
 		acmlVol   int64,
 		eventTime time.Time,
+		mkopCode  string,
 	) error
 	UpdateBuyVolume(ctx context.Context, stockCode string, shnuCntgSmtn float64)
 }

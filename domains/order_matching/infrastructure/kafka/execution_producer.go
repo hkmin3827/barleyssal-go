@@ -10,6 +10,7 @@ import (
 
 	"barleyssal-go/config"
 	matchingapplication "barleyssal-go/domains/order_matching/application"
+	"barleyssal-go/shared/utils"
 
 	kfkgo "github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -17,8 +18,6 @@ import (
 
 const executionTopic = "execution.event"
 
-// ExecutionProducer publishes execution events to Kafka.
-// It implements matchingapplication.ExecutionPublisher.
 type ExecutionProducer struct {
 	writer    *kfkgo.Writer
 	log       *zap.Logger
@@ -26,10 +25,8 @@ type ExecutionProducer struct {
 	connected bool
 }
 
-// Ensure interface compliance at compile time.
 var _ matchingapplication.ExecutionPublisher = (*ExecutionProducer)(nil)
 
-// NewExecutionProducer creates a new Kafka producer for execution events.
 func NewExecutionProducer(cfg *config.Config, log *zap.Logger) *ExecutionProducer {
 	w := &kfkgo.Writer{
 		Addr:                   kfkgo.TCP(cfg.Kafka.Brokers...),
@@ -44,7 +41,6 @@ func NewExecutionProducer(cfg *config.Config, log *zap.Logger) *ExecutionProduce
 	return &ExecutionProducer{writer: w, log: log}
 }
 
-// Connect marks the producer as ready.
 func (p *ExecutionProducer) Connect(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -53,8 +49,6 @@ func (p *ExecutionProducer) Connect(_ context.Context) error {
 	return nil
 }
 
-// PublishExecutionEvent sends an execution event to Kafka.
-// Implements matchingapplication.ExecutionPublisher.
 func (p *ExecutionProducer) PublishExecutionEvent(ctx context.Context, params matchingapplication.ExecutionEventParams) error {
 	payload := map[string]interface{}{
 		"orderId":          params.OrderID,
@@ -63,9 +57,11 @@ func (p *ExecutionProducer) PublishExecutionEvent(ctx context.Context, params ma
 		"accountId":        params.AccountID,
 		"stockCode":        params.StockCode,
 		"orderSide":        params.OrderSide,
+		"orderType":			params.OrderType,
 		"executedQuantity": params.ExecutedQty,
 		"executedPrice":    params.ExecutedPrice,
-		"timestamp":       time.Now().UnixMilli(),
+		"executionStatus": params.ExecutionStatus,
+		"timestamp":      utils.NowMillis(),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -87,7 +83,6 @@ func (p *ExecutionProducer) PublishExecutionEvent(ctx context.Context, params ma
 	return nil
 }
 
-// Disconnect closes the Kafka writer.
 func (p *ExecutionProducer) Disconnect() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -27,8 +28,8 @@ type HoldingDetail struct {
 	AvgPrice      float64 `json:"avgPrice"`
 	CurrentPrice  float64 `json:"currentPrice"`
 	HoldValue     float64 `json:"holdValue"`
-	PnlAmount     float64 `json:"pnlAmount"`  // (currentPrice - avgPrice) * qty
-	PnlRate       float64 `json:"pnlRate"`    // % 수익률
+	PnlAmount     float64 `json:"pnlAmount"`
+	PnlRate       float64 `json:"pnlRate"`  
 }
 
 type PnlUpdatePayload struct {
@@ -36,10 +37,10 @@ type PnlUpdatePayload struct {
 	UserID              string          `json:"userId"`
 	Deposit             float64         `json:"deposit"`
 	Principal           float64         `json:"principal"`
-	StockValue          float64         `json:"stockValue"`          // 보유 주식 평가금액 합계
-	RealtimeTotalEquity float64         `json:"realtimeTotalEquity"` // deposit + stockValue
-	TotalPnlAmount      float64         `json:"totalPnlAmount"`      // 주식 평가손익 합계 (원금 차이 아님)
-	TotalPnlRate        float64         `json:"totalPnlRate"`        // 전체 수익률 (원금 기준)
+	StockValue          float64         `json:"stockValue"`   
+	RealtimeTotalEquity float64         `json:"realtimeTotalEquity"` 
+	TotalPnlAmount      float64         `json:"totalPnlAmount"`  
+	TotalPnlRate        float64         `json:"totalPnlRate"`
 	Holdings            []HoldingDetail `json:"holdings"`
 	Ts                  int64           `json:"ts"`
 }
@@ -50,8 +51,8 @@ type PnlService struct {
 	log      *zap.Logger
 
 	mu               sync.RWMutex
-	stockSubscribers map[string]map[string]struct{} // stockCode -> set of userIDs
-	userHoldings     map[string]map[string]struct{} // userId    -> set of stockCodes
+	stockSubscribers map[string]map[string]struct{}
+	userHoldings     map[string]map[string]struct{}
 }
 
 func New(rdb *redis.Client, notifier ports.UserNotifier, log *zap.Logger) *PnlService {
@@ -92,8 +93,6 @@ func (s *PnlService) SubscribeUser(ctx context.Context, userID string) error {
 	}
 	s.log.Debug("PnL subscription registered", zap.String("userId", userID), zap.Strings("codes", codeList))
 
-	// 즉시 초기 스냅샷 전송: triggerCode = "" 이면 calcAndPush가
-	// 모든 종목 가격을 Redis에서 조회하여 PNL_UPDATE를 바로 전송한다.
 	go func() {
 		if err := s.calcAndPush(context.Background(), userID, 0, ""); err != nil {
 			s.log.Warn("initial PNL snapshot failed", zap.String("userId", userID), zap.Error(err))
@@ -103,7 +102,6 @@ func (s *PnlService) SubscribeUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// UnsubscribeUser removes all price subscriptions for the user.
 func (s *PnlService) UnsubscribeUser(userID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,7 +159,33 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		return fmt.Errorf("holdings meta: %w", err)
 	}
 
+	codes := make([]string, 0, len(holdingsMeta))
+	for code := range holdingsMeta {
+		codes = append(codes, code)
+	}
+
+	redisPrice := make(map[string]float64, len(codes))
+	if len(codes) > 0 {
+		pipe := s.rdb.Pipeline()
+		cmds := make(map[string]*redis.SliceCmd, len(codes))
+		for _, code := range codes {
+			cmds[code] = pipe.HMGet(ctx, "market:info:"+code, "price")
+		}
+		if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+			s.log.Warn("market:info batch fetch failed", zap.Error(err))
+		}
+		for code, cmd := range cmds {
+			vals := cmd.Val()
+			if len(vals) > 0 && vals[0] != nil {
+				if p := parseInfoPrice(vals[0]); p > 0 {
+					redisPrice[code] = p
+				}
+			}
+		}
+	}
+
 	var stockValue float64
+	var totalCostBasis float64
 	var totalPnlAmount float64
 	holdingDetails := make([]HoldingDetail, 0, len(holdingsMeta))
 
@@ -175,24 +199,19 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 			continue
 		}
 
+		avgPrice, _ := strconv.ParseFloat(meta.AvgPrice, 64)
+
 		var currentPrice float64
-		if code == triggerCode {
+		if code == triggerCode && triggerPrice > 0 {
 			currentPrice = triggerPrice
+		} else if p, ok := redisPrice[code]; ok {
+			currentPrice = p
 		} else {
-			priceStr, err := s.rdb.Get(ctx, "market:price:"+code).Result()
-			if err != nil || priceStr == "" {
-				// Redis에 시세 없으면 평단가로 대체 (손익 0으로 표시)
-				avgP, _ := strconv.ParseFloat(meta.AvgPrice, 64)
-				currentPrice = avgP
-			} else {
-				currentPrice, _ = strconv.ParseFloat(priceStr, 64)
-			}
+			currentPrice = avgPrice
 		}
 
-		avgPrice, _ := strconv.ParseFloat(meta.AvgPrice, 64)
 		holdValue := currentPrice * float64(totalQty)
 
-		// 종목별 평가손익 = (현재가 - 평단가) × 수량
 		pnlAmount := (currentPrice - avgPrice) * float64(totalQty)
 
 		var pnlRate float64
@@ -201,6 +220,7 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		}
 
 		stockValue += holdValue
+		totalCostBasis += avgPrice * float64(totalQty)
 		totalPnlAmount += pnlAmount
 
 		holdingDetails = append(holdingDetails, HoldingDetail{
@@ -214,13 +234,15 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		})
 	}
 
-	// 총 자산 = 예수금 + 주식 평가금액
+	sort.Slice(holdingDetails, func(i, j int) bool {
+		return holdingDetails[i].HoldValue > holdingDetails[j].HoldValue
+	})
+
 	realtimeTotalEquity := deposit + stockValue
 
-	// 전체 수익률: 원금 기준 (예수금+평가금 vs 원금)
 	var totalPnlRate float64
-	if principal > 0 {
-		totalPnlRate = ((realtimeTotalEquity - principal) / principal) * 100
+	if totalCostBasis > 0 {
+		totalPnlRate = ((stockValue - totalCostBasis) / totalCostBasis) * 100
 	}
 
 	payload := PnlUpdatePayload{
@@ -230,7 +252,7 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		Principal:           principal,
 		StockValue:          math.Round(stockValue*100) / 100,
 		RealtimeTotalEquity: math.Round(realtimeTotalEquity*100) / 100,
-		TotalPnlAmount:      math.Round(totalPnlAmount*100) / 100, // 주식 평가손익만
+		TotalPnlAmount:      math.Round(totalPnlAmount*100) / 100,
 		TotalPnlRate:        math.Round(totalPnlRate*100) / 100,
 		Holdings:            holdingDetails,
 		Ts:                  time.Now().UnixMilli(),
@@ -238,4 +260,13 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 
 	s.notifier.PushToUser(userID, payload)
 	return nil
+}
+
+func parseInfoPrice(v interface{}) float64 {
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
 }

@@ -14,9 +14,6 @@ import (
 	"barleyssal-go/shared/ports"
 )
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 내부 타입
-// ──────────────────────────────────────────────────────────────────────────────
 
 type clientMeta struct {
 	mu                sync.Mutex
@@ -30,7 +27,6 @@ type incomingMsg struct {
 	UserID  interface{} `json:"userId"`
 }
 
-// client: 단일 WebSocket 연결
 type client struct {
 	conn *websocket.Conn
 	send chan []byte
@@ -39,23 +35,20 @@ type client struct {
 	log  *zap.Logger
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Hub
-// ──────────────────────────────────────────────────────────────────────────────
-
-// Hub: WebSocket 서버 허브. ports.UserNotifier를 구현한다.
 type Hub struct {
 	log      *zap.Logger
 	upgrader websocket.Upgrader
-	pnlSvc   ports.PnlSubscriptionService // 순환 의존성 방지를 위해 생성 후 주입
+	pnlSvc   ports.PnlSubscriptionService 
 
 	mu           sync.RWMutex
-	userClients  map[string]map[*client]struct{} // userID → 연결 집합
-	priceClients map[string]map[*client]struct{} // stockCode → 연결 집합
+	userClients  map[string]map[*client]struct{}
+	priceClients map[string]map[*client]struct{}
 	allClients   map[*client]struct{}
 
 	connCount int64 // atomic
 }
+
+
 
 func NewHub(log *zap.Logger) *Hub {
 	return &Hub{
@@ -75,7 +68,6 @@ func (h *Hub) SetPnlService(svc ports.PnlSubscriptionService) {
 	h.pnlSvc = svc
 }
 
-// ServeHTTP: HTTP 연결을 WebSocket으로 업그레이드 후 클라이언트 루프 실행
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -103,14 +95,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.sendJSON(map[string]interface{}{"type": "CONNECTED", "ts": nowMS()})
 
 	go c.writePump()
-	c.readPump() // 연결 종료까지 블로킹
+	c.readPump()
 
 	atomic.AddInt64(&h.connCount, -1)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 클라이언트 read/write 루프
-// ──────────────────────────────────────────────────────────────────────────────
 
 func (c *client) readPump() {
 	defer func() {
@@ -175,9 +164,7 @@ func (c *client) sendJSON(v interface{}) {
 	}
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 메시지 핸들러
-// ──────────────────────────────────────────────────────────────────────────────
+
 
 func (h *Hub) handleMessage(c *client, raw []byte) {
 	var msg incomingMsg
@@ -189,7 +176,21 @@ func (h *Hub) handleMessage(c *client, raw []byte) {
 	case "SUBSCRIBE_PRICE":
 		h.handleSubscribePrice(c, msg.Symbols)
 
+	case "IDENTIFY_USER":
+		// userClients 등록만 — PnlService 구독 없음 (알림 수신 전용)
+		var userID string
+		switch v := msg.UserID.(type) {
+		case string:
+			userID = v
+		case float64:
+			userID = floatToString(v)
+		}
+		if userID != "" {
+			h.handleIdentifyUser(c, userID)
+		}
+
 	case "SUBSCRIBE_ACCOUNT":
+		// userClients 등록 + PnlService 구독 (AccountPage 전용)
 		var userID string
 		switch v := msg.UserID.(type) {
 		case string:
@@ -214,7 +215,7 @@ func (h *Hub) handleSubscribePrice(c *client, symbols []string) {
 	defer c.meta.mu.Unlock()
 
 	h.mu.Lock()
-	// 기존 구독 해제
+
 	for code := range c.meta.subscribedSymbols {
 		if s := h.priceClients[code]; s != nil {
 			delete(s, c)
@@ -223,7 +224,7 @@ func (h *Hub) handleSubscribePrice(c *client, symbols []string) {
 			}
 		}
 	}
-	// 새 구독 등록
+
 	c.meta.subscribedSymbols = make(map[string]struct{}, len(symbols))
 	for _, code := range symbols {
 		if h.priceClients[code] == nil {
@@ -235,6 +236,30 @@ func (h *Hub) handleSubscribePrice(c *client, symbols []string) {
 	h.mu.Unlock()
 
 	c.sendJSON(map[string]interface{}{"type": "SUBSCRIBED_PRICE", "symbols": symbols, "ts": nowMS()})
+}
+
+func (h *Hub) handleIdentifyUser(c *client, userID string) {
+	c.meta.mu.Lock()
+	oldUserID := c.meta.userID
+	if oldUserID != "" && oldUserID != userID {
+		h.mu.Lock()
+		if s := h.userClients[oldUserID]; s != nil {
+			delete(s, c)
+			if len(s) == 0 {
+				delete(h.userClients, oldUserID)
+			}
+		}
+		h.mu.Unlock()
+	}
+	c.meta.userID = userID
+	c.meta.mu.Unlock()
+
+	h.mu.Lock()
+	if h.userClients[userID] == nil {
+		h.userClients[userID] = make(map[*client]struct{})
+	}
+	h.userClients[userID][c] = struct{}{}
+	h.mu.Unlock()
 }
 
 func (h *Hub) handleSubscribeAccount(c *client, userID string) {
@@ -312,11 +337,8 @@ func (h *Hub) disconnect(c *client) {
 	close(c.send)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 브로드캐스트 메서드 (ports.UserNotifier 구현)
-// ──────────────────────────────────────────────────────────────────────────────
 
-// BroadcastPriceUpdate: 특정 종목을 구독한 클라이언트에게만 PRICE_UPDATE 전송
+
 func (h *Hub) BroadcastPriceUpdate(stockCode string, tickData map[string]interface{}) {
 	payload, _ := json.Marshal(tickData)
 
@@ -332,7 +354,6 @@ func (h *Hub) BroadcastPriceUpdate(stockCode string, tickData map[string]interfa
 	}
 }
 
-// BroadcastToAll: 연결된 모든 클라이언트에게 전송 (랭킹 등)
 func (h *Hub) BroadcastToAll(payload []byte) {
 	h.mu.RLock()
 	clients := copyClientSet(h.allClients)
@@ -346,7 +367,6 @@ func (h *Hub) BroadcastToAll(payload []byte) {
 	}
 }
 
-// PushToUser: 특정 userId의 모든 연결에 JSON 전송
 func (h *Hub) PushToUser(userID string, data interface{}) {
 	h.mu.RLock()
 	clients := copyClientSet(h.userClients[userID])
@@ -369,7 +389,6 @@ func (h *Hub) PushToUser(userID string, data interface{}) {
 	}
 }
 
-// NotifyExecution: 체결 알림 + PnL 구독 갱신
 func (h *Hub) NotifyExecution(data interface{}) {
 	m, ok := data.(map[string]interface{})
 	if !ok {
@@ -389,14 +408,12 @@ func (h *Hub) NotifyExecution(data interface{}) {
 	}
 }
 
-// GetConnectedCount: 현재 연결된 WebSocket 클라이언트 수
 func (h *Hub) GetConnectedCount() int {
 	return int(atomic.LoadInt64(&h.connCount))
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 헬퍼
-// ──────────────────────────────────────────────────────────────────────────────
+
+
 
 func copyClientSet(s map[*client]struct{}) map[*client]struct{} {
 	cp := make(map[*client]struct{}, len(s))

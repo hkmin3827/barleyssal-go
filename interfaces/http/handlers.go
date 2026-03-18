@@ -45,13 +45,39 @@ func (h *Handler) RegisterRoutes(e *echo.Echo) {
 	market.GET("/search", h.searchStocks)
 	market.GET("/account/pnl/:userId", h.getAccountPnl)
 
-	e.GET("/api/stocks", h.getSortedStocks)  // stocksPage 정렬
-
-	e.GET("/api/stocks/info/:code", h.getStockInfo)  // stockDetailPage 초기 seed
+	e.GET("/api/stocks", h.getSortedStocks)
+	e.GET("/api/stocks/batch", h.getStocksBatch) 
+	e.GET("/api/stocks/info/:code", h.getStockInfo)
 
 	e.GET("/api/health", h.health)
 	e.GET("/ws", echo.WrapHandler(h.hub))
 }
+
+func (h *Handler) getStocksBatch(c echo.Context) error {
+	raw := c.QueryParam("codes")
+	if raw == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "codes query param required"})
+	}
+ 
+	codes := make([]string, 0, 16)
+	for _, code := range strings.Split(raw, ",") {
+		code = strings.TrimSpace(strings.ToUpper(code))
+		if code != "" {
+			codes = append(codes, code)
+		}
+	}
+	if len(codes) == 0 {
+		return c.JSON(http.StatusOK, echo.Map{"stocks": []interface{}{}})
+	}
+ 
+	stocks, err := h.priceSvc.GetStocksBatch(c.Request().Context(), codes)
+	if err != nil {
+		h.log.Warn("getStocksBatch failed", zap.Error(err))
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "batch fetch failed"})
+	}
+	return c.JSON(http.StatusOK, echo.Map{"stocks": stocks})
+}
+ 
 
 func (h *Handler) getSortedStocks(c echo.Context) error {
 	sortKey := c.QueryParam("sort")
@@ -59,15 +85,9 @@ func (h *Handler) getSortedStocks(c echo.Context) error {
 		sortKey = "changeRate"
 	}
  
-	if sortKey == "name" {
+	if sortKey != "name" && sortKey != "changeRate" && sortKey != "acmlVol" {
 		return c.JSON(http.StatusBadRequest, echo.Map{
-			"error": "name sort is handled by frontend using stocks.js",
-		})
-	}
- 
-	if sortKey != "changeRate" && sortKey != "acmlVol" {
-		return c.JSON(http.StatusBadRequest, echo.Map{
-			"error": "sort must be one of: changeRate, acmlVol",
+			"error": "sort must be one of: name, changeRate, acmlVol",
 		})
 	}
  
@@ -89,25 +109,27 @@ func (h *Handler) getStockInfo(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": "stock code required"})
 	}
  
-	info, err := h.priceSvc.GetStockInfo(c.Request().Context(), code)
+	info, mkopCode, err := h.priceSvc.GetStockInfo(c.Request().Context(), code)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "info fetch failed"})
 	}
- 
+
 	if info["price"] == 0 {
 		return c.JSON(http.StatusNotFound, echo.Map{"error": "price not available yet"})
 	}
- 
+
 	return c.JSON(http.StatusOK, echo.Map{
 		"stockCode":  code,
 		"price":      info["price"],
 		"changeRate": info["changeRate"],
+		"prdyVrssSign": info["prdyVrssSign"],
 		"prdyVrss":   info["prdyVrss"],
 		"stckOprc":   info["stckOprc"],
 		"stckHgpr":   info["stckHgpr"],
 		"stckLwpr":   info["stckLwpr"],
-		"volume": info["volume"],  // 체결 거래량 (cntg_vol)
+		"volume":     info["volume"],  // 체결 거래량 (cntg_vol)
 		"acmlVol":    int64(info["acmlVol"]),
+		"mKopCode":   mkopCode,
 		"ts":         time.Now().UnixMilli(),
 	})
 }
@@ -191,6 +213,7 @@ func (h *Handler) getAccountPnl(c echo.Context) error {
 	}
 
 	var stockValue float64
+	var totalCostBasis float64
 	holdings := make([]holdingResp, 0, len(holdingsMeta))
 
 	for code, metaStr := range holdingsMeta {
@@ -220,6 +243,7 @@ func (h *Handler) getAccountPnl(c echo.Context) error {
 			pnlRate = ((currentPrice - avgPrice) / avgPrice) * 100
 		}
 		stockValue += holdValue
+		totalCostBasis += avgPrice * float64(totalQty)
 		holdings = append(holdings, holdingResp{
 			StockCode:    code,
 			TotalQty:     totalQty,
@@ -232,8 +256,8 @@ func (h *Handler) getAccountPnl(c echo.Context) error {
 
 	realtimeTotalEquity := deposit + stockValue
 	var totalPnlRate float64
-	if principal > 0 {
-		totalPnlRate = ((realtimeTotalEquity - principal) / principal) * 100
+	if totalCostBasis > 0 {
+		totalPnlRate = ((stockValue - totalCostBasis) / totalCostBasis) * 100
 	}
 	return c.JSON(http.StatusOK, echo.Map{
 		"userId":              userID,

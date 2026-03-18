@@ -16,8 +16,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// ExternalMarketClient는 KIS(한국투자증권) 실시간 시세 웹소켓 클라이언트다.
-// 틱 데이터를 수신하여 priceHook(PriceService)과 hub(WebSocket Hub)에 전달한다.
 type ExternalMarketClient struct {
 	wsURL     string
 	watchList []string
@@ -58,6 +56,7 @@ func (c *ExternalMarketClient) Start(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	c.stopping = false
+	c.stopCh = make(chan struct{})
 	c.mu.Unlock()
 
 	if _, err := c.authSvc.FetchApprovalKey(ctx); err != nil {
@@ -71,6 +70,7 @@ func (c *ExternalMarketClient) Stop() {
 	c.mu.Lock()
 	c.stopping = true
 	conn := c.conn
+	c.conn = nil
 	c.mu.Unlock()
 
 	close(c.stopCh)
@@ -100,47 +100,51 @@ func (c *ExternalMarketClient) connect(ctx context.Context) {
 	c.log.Info("KIS WS 연결 성공")
 	c.subscribeAll(conn)
 
-	// ==========================================
-	// go func() {
-	// 	ticker := time.NewTicker(2 * time.Second) // 2초마다 가짜 데이터 생성
-	// 	defer ticker.Stop()
-	// 	for {
-	// 		select {
-	// 		case <-c.stopCh:
-	// 			return
-	// 		case <-ticker.C:
-	// 			// 시간 생성 (HHMMSS)
-	// 			nowStr := time.Now().Format("150405")
-				
-	// 			// KIS 실시간 데이터 포맷에 맞춘 가짜 문자열 (총 35개 필드, 구분자 ^)
-	// 			// 인덱스 0:종목(005930), 1:시간, 2:현재가(80000), 3:전일대비부호(2), 4:전일대비(100), 5:등락율(0.12), 12:단일체결량(10) 등
-	// 			mockFields := []string{
-	// 				"005930", nowStr, "80000", "2", "100", "0.12", "80000", "79000", "80500", "78500",
-	// 				"80100", "79900", "10", "1000000", "80000000000", "500", "600",
-	// 				"0", "55.5", "0", "600000", "0", "0", "0", "0", "0", "0", "0", "0", "0",
-	// 				"0", "0", "0", "0", "20",
-	// 			}
-	// 			mockData := fmt.Sprintf("0|H0STCNT0|001|%s", strings.Join(mockFields, "^"))
-
-	// 			// handleMessage 호출 (실제 로직 태우기)
-	// 			c.handleMessage(ctx, mockData, c.conn)
-	// 		}
-	// 	}
-	// }()
-	// ==========================================
 	
+	const pongWait = 60 * time.Second
+	const pingPeriod = (pongWait * 9) / 10 
+	
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+
+	conn.SetPongHandler(func(string) error { 
+        conn.SetReadDeadline(time.Now().Add(pongWait))
+        return nil 
+    })
+
+	go func() {
+        ticker := time.NewTicker(pingPeriod)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ticker.C:
+                c.mu.Lock()
+                if c.conn != nil {
+                    if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+                        c.log.Warn("Standard Ping failed", zap.Error(err))
+                    }
+                }
+                c.mu.Unlock()
+            case <-c.stopCh:
+                return
+            }
+        }
+    }()
+
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			select {
 			case <-c.stopCh:
+				c.log.Info("스케줄러에 의해 정상적으로 수신 루프가 종료되었습니다.")
 				return
 			default:
 			}
-			c.log.Warn("KIS WS read error", zap.Error(err))
+			c.log.Warn("KIS WS 비정상 연결 끊김 감지", zap.Error(err))
+
 			c.scheduleReconnect(ctx)
 			return
 		}
+		conn.SetReadDeadline(time.Now().Add(pongWait))
 		c.handleMessage(ctx, string(raw), conn)
 	}
 }
@@ -161,6 +165,58 @@ func (c *ExternalMarketClient) scheduleReconnect(ctx context.Context) {
 	go c.connect(ctx)
 }
 
+func (c *ExternalMarketClient) RunScheduler(ctx context.Context) {
+	loc, err := time.LoadLocation("Asia/Seoul")
+	if err != nil {
+		c.log.Error("타임존 로드 실패, KST 대신 Local 시간 사용", zap.Error(err))
+		loc = time.Local
+	}
+
+	ticker := time.NewTicker(1 * time.Minute) // 1분마다 시간 체크
+	defer ticker.Stop()
+
+	// 시작하자마자 현재 시간 체크해서 켤지 말지 결정
+	c.checkAndToggle(ctx, loc)
+
+	for {
+		select {
+		case <-ctx.Done(): // 메인 서버 종료 시 스케줄러도 종료
+			return
+		case <-ticker.C:
+			c.checkAndToggle(ctx, loc)
+		}
+	}
+}
+
+func (c *ExternalMarketClient) checkAndToggle(ctx context.Context, loc *time.Location) {
+	now := time.Now().In(loc)
+	
+	// 평일 (월~금) 체크
+	isWeekday := now.Weekday() >= time.Monday && now.Weekday() <= time.Friday
+	
+	// 시간 코드로 변환 (예: 08:30 -> 830, 16:00 -> 1600)
+	hour, min, _ := now.Clock()
+	timeCode := hour*100 + min
+
+	// 동작 시간: 평일 08:30 ~ 16:00 (시뮬레이션 환경에 맞춰 조정 가능)
+	isActiveTime := isWeekday && timeCode >= 630 && timeCode <= 1800
+
+	c.mu.Lock()
+	isRunning := !c.stopping && c.conn != nil
+	c.mu.Unlock()
+
+	if isActiveTime && !isRunning {
+		c.log.Info("📈 장 운영 시간입니다. KIS WS 연결을 시작합니다.")
+		// 기존 Start 내부에서 stopCh를 다시 make 해주는 로직이 필요합니다 (아래 STEP 2 참고)
+		if err := c.Start(ctx); err != nil {
+			c.log.Error("스케줄러: KIS WS 시작 실패", zap.Error(err))
+		}
+	} else if !isActiveTime && isRunning {
+		c.log.Info("💤 장 마감 시간입니다. KIS WS 연결을 안전하게 종료합니다.")
+		c.Stop()
+	}
+}
+
 func (c *ExternalMarketClient) subscribeAll(conn *websocket.Conn) {
 	key := c.authSvc.GetApprovalKey()
 	if key == "" {
@@ -169,7 +225,7 @@ func (c *ExternalMarketClient) subscribeAll(conn *websocket.Conn) {
 	}
 	for i, code := range c.watchList {
 		time.Sleep(time.Duration(i) * 50 * time.Millisecond)
-		_ = conn.WriteMessage(websocket.TextMessage, c.buildMsg(key, code, "1"))
+		_ = c.safeWrite(conn, websocket.TextMessage, c.buildMsg(key, code, "1"))
 	}
 	c.log.Info("KIS 구독 요청 완료", zap.Int("count", len(c.watchList)))
 }
@@ -181,7 +237,7 @@ func (c *ExternalMarketClient) unsubscribeAll(conn *websocket.Conn) {
 	}
 	for i, code := range c.watchList {
 		time.Sleep(time.Duration(i) * 50 * time.Millisecond)
-		_ = conn.WriteMessage(websocket.TextMessage, c.buildMsg(key, code, "2"))
+		_ = c.safeWrite(conn, websocket.TextMessage, c.buildMsg(key, code, "2"))
 	}
 }
 
@@ -200,14 +256,12 @@ func (c *ExternalMarketClient) buildMsg(approvalKey, code, trType string) []byte
 
 func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, conn *websocket.Conn) {
 
-	// c.log.Info("KIS RAW RESPONSE", zap.String("raw_data", raw))
-
 	if strings.HasPrefix(raw, "{") {
 		var j map[string]interface{}
 		if err := json.Unmarshal([]byte(raw), &j); err == nil {
 			if hdr, ok := j["header"].(map[string]interface{}); ok {
 				if hdr["tr_id"] == "PINGPONG" {
-					_ = conn.WriteMessage(websocket.TextMessage, []byte(raw))
+				_ = c.safeWrite(conn, websocket.TextMessage, []byte(raw))
 				}
 			}
 		}
@@ -263,8 +317,9 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 	parsedKST, _ := time.ParseInLocation("20060102150405", fullTimeStr, loc)
 	utcTime := parsedKST.UTC()
 
+	prdyVrssSignInt := parseInt64(prdyVrssSign)
 
-	if err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, changeRate, int64(cntgVol), prdyVrss, stckOprc, stckHgpr, stckLwpr, acmlVol, utcTime,); err != nil {
+	if err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, changeRate, int64(cntgVol), prdyVrssSignInt ,prdyVrss, stckOprc, stckHgpr, stckLwpr, acmlVol, utcTime, mkopCode); err != nil {
 		c.log.Warn("priceHook.OnPriceUpdate failed", zap.String("stockCode", stockCode), zap.Error(err))
 	}
 
@@ -285,8 +340,8 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 		"stckLwpr":        stckLwpr,
 		"askp1":           askp1,
 		"bidp1":           bidp1,
-		"cntgVol":         cntgVol,   // 단일 체결량 (차트 live bar volume 갱신용)
-		"acmlVol":         acmlVol,   // 당일 누적 거래량 (UI 표시용)
+		"cntgVol":         cntgVol,  
+		"acmlVol":         acmlVol,  
 		"acmlTrPbmn":      acmlTrPbmn,
 		"cttr":            cttr,
 		"selnCntgCsnu":    selnCntgCsnu,
@@ -296,4 +351,22 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 		"ts":              utcTime.UnixMilli(),
 	}
 	c.hub.BroadcastPriceUpdate(stockCode, tickData)
+}
+
+func parseInt64(v interface{}) int64 {
+	if v == nil {
+		return 0
+	}
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	i, _ := strconv.ParseInt(s, 10, 64)
+	return i
+}
+
+func (c *ExternalMarketClient) safeWrite(conn *websocket.Conn, messageType int, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return conn.WriteMessage(messageType, data)
 }

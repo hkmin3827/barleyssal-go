@@ -24,7 +24,6 @@ const (
 	tokenTTL         = 86_100 * time.Second // ~23h 55m
 )
 
-// KisAuthService manages KIS OAuth2 approval keys and access tokens.
 type KisAuthService struct {
 	cfg   *config.Config
 	rdb   *redis.Client
@@ -37,7 +36,6 @@ type KisAuthService struct {
 	accessToken string
 }
 
-// New creates a new KisAuthService.
 func New(cfg *config.Config, rdb *redis.Client, log *zap.Logger) *KisAuthService {
 	return &KisAuthService{
 		cfg:  cfg,
@@ -47,18 +45,12 @@ func New(cfg *config.Config, rdb *redis.Client, log *zap.Logger) *KisAuthService
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public accessors
-// ─────────────────────────────────────────────────────────────────────────────
-
-// GetApprovalKey returns the in-memory approval key (may be empty).
 func (s *KisAuthService) GetApprovalKey() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.approvalKey
 }
 
-// GetAccessToken returns a valid access token, loading from Redis if needed.
 func (s *KisAuthService) GetAccessToken(ctx context.Context) (string, error) {
 	s.mu.RLock()
 	if s.accessToken != "" {
@@ -68,7 +60,6 @@ func (s *KisAuthService) GetAccessToken(ctx context.Context) (string, error) {
 	}
 	s.mu.RUnlock()
 
-	// Try Redis cache
 	cached, err := s.rdb.Get(ctx, redisTokenKey).Result()
 	if err == nil && cached != "" {
 		s.mu.Lock()
@@ -78,15 +69,11 @@ func (s *KisAuthService) GetAccessToken(ctx context.Context) (string, error) {
 		return cached, nil
 	}
 
-	s.log.Info("Redis에 토큰이 없어 신규 발급을 시도합니다.")
+	s.log.Info("Redis에 토큰 X -> 신규 발급 시도 ....")
 	return s.FetchAccessToken(ctx)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Token & Key fetching
-// ─────────────────────────────────────────────────────────────────────────────
 
-// FetchApprovalKey fetches (or reuses from Redis) the KIS WebSocket approval key.
 func (s *KisAuthService) FetchApprovalKey(ctx context.Context) (string, error) {
 	// Check Redis cache first
 	cached, err := s.rdb.Get(ctx, redisApprovalKey).Result()
@@ -148,7 +135,6 @@ func (s *KisAuthService) FetchApprovalKey(ctx context.Context) (string, error) {
 	return result.ApprovalKey, nil
 }
 
-// FetchAccessToken fetches a new KIS OAuth2 access token from the API.
 func (s *KisAuthService) FetchAccessToken(ctx context.Context) (string, error) {
 	ext := s.cfg.External
 	if ext.KisAppKey == "" || ext.KisAppSecret == "" {
@@ -196,11 +182,8 @@ func (s *KisAuthService) FetchAccessToken(ctx context.Context) (string, error) {
 	return result.AccessToken, nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Scheduler
-// ─────────────────────────────────────────────────────────────────────────────
 
-// StartTokenScheduler registers a daily midnight cron job to refresh the access token.
+
 func (s *KisAuthService) StartTokenScheduler() {
 	if s.sched != nil {
 		s.log.Warn("KIS Token Scheduler가 이미 실행 중입니다.")
@@ -218,7 +201,7 @@ func (s *KisAuthService) StartTokenScheduler() {
 		ctx := context.Background()
 		if _, err := s.FetchAccessToken(ctx); err != nil {
 			s.log.Error("[Cron] KIS Access Token 재발급 실패", zap.Error(err))
-			// 5분 후 1회 재시도
+
 			time.AfterFunc(5*time.Minute, func() {
 				if _, err := s.FetchAccessToken(ctx); err != nil {
 					s.log.Error("[Cron] KIS Access Token 재시도 실패 – 서버 관리자 수동 발급 필요", zap.Error(err))
@@ -234,7 +217,6 @@ func (s *KisAuthService) StartTokenScheduler() {
 	s.log.Info("KIS Access Token 자동 갱신 스케줄러 등록 (매일 00:00 KST)")
 }
 
-// StopTokenScheduler stops the cron scheduler.
 func (s *KisAuthService) StopTokenScheduler() {
 	if s.sched != nil {
 		s.sched.Stop()
@@ -242,8 +224,6 @@ func (s *KisAuthService) StopTokenScheduler() {
 	}
 }
 
-// InitKisAuth initialises authentication: loads cached tokens from Redis or
-// fetches new ones, then starts the renewal scheduler.
 func (s *KisAuthService) InitKisAuth(ctx context.Context) error {
 	s.log.Info("KIS 인증 정보 초기화 시작...")
 
@@ -259,7 +239,6 @@ func (s *KisAuthService) InitKisAuth(ctx context.Context) error {
 		}
 	}
 
-	// Approval Key
 	if cached, err := s.rdb.Get(ctx, redisApprovalKey).Result(); err == nil && cached != "" {
 		s.mu.Lock()
 		s.approvalKey = cached

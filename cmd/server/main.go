@@ -33,7 +33,7 @@ func main() {
 
 	cfg := config.Load()
 
-	// ── Redis ────────────────────────────────────────────────────────────────
+	// 레디스
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
 		Password: cfg.Redis.Password,
@@ -49,19 +49,18 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// ── KIS Auth Service ─────────────────────────────────────────────────────
+	// KIS AUTH
 	authSvc := kisauth.New(cfg, rdb, log)
 	if err := authSvc.InitKisAuth(ctx); err != nil {
 		log.Error("Failed to initialize KIS Auth – API calls may fail", zap.Error(err))
 	}
 
-	// ── Kafka Execution Producer ─────────────────────────────────────────────
+	// 카프카
 	execProducer := orderkafka.NewExecutionProducer(cfg, log)
 	if err := execProducer.Connect(ctx); err != nil {
 		log.Error("Kafka producer connection failed – executions will not work", zap.Error(err))
 	}
 
-	// ── Dependency wiring ────────────────────────────────────────────────────
 	hub := wshub.NewHub(log)
 
 	pnlSvc := pnlapp.New(rdb, hub, log)
@@ -74,13 +73,13 @@ func main() {
 
 	priceSvc := price.New(cfg, rdb, chartSvc, matchEng, pnlSvc, log)
 
-	// ── Register stocks in Redis ─────────────────────────────────────────────
+	// 레디스에 stock 종목 등록 (이미 있는 값은 패스)
 	watchCodes := config.WatchList(40)
 	if err := priceSvc.RegisterStocks(ctx, watchCodes); err != nil {
 		log.Warn("registerStocks failed", zap.Error(err))
 	}
 	
-	// ── Kafka Order Consumer ─────────────────────────────────────────────────
+	// 카프카 컨슈머
 	orderConsumer := orderkafka.NewOrderConsumer(cfg, func(ctx context.Context, ev orderkafka.OrderRequestEvent) error {
 		return matchEng.OnOrderReceived(ctx, matchingapp.OrderEvent{
 			OrderID:    ev.OrderID,
@@ -98,7 +97,7 @@ func main() {
 	cancelCtx, cancelFn := context.WithCancel(ctx)
 	orderConsumer.Start(cancelCtx)
 
-	// ── External KIS WebSocket Client ────────────────────────────────────────
+	// KIS ws 클라이언트
 	extClient := wshub.NewExternalMarketClient(
 		cfg.External.WsURL,
 		watchCodes,
@@ -107,12 +106,14 @@ func main() {
 		hub,
 		log,
 	)
+
+	go extClient.RunScheduler(cancelCtx)
 	if err := extClient.Start(ctx); err != nil {
 		log.Error("KIS external client failed to start", zap.Error(err))
 	}
 
-	// ── 실시간 랭킹 브로드캐스트 스케줄러 ──
 go func() {
+	log.Info("실시간 랭킹 스케쥴러 티커 활동")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -123,7 +124,6 @@ go func() {
 		case <-ticker.C:
 			broadcastCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 
-			// 1. 당일 등락률 상위 10개 (홈페이지 "최고 상승률" 퀵스탯 + 등락률 랭킹)
 			topChangeRate, err := priceSvc.GetTopChangeRate(broadcastCtx, 10)
 			if err != nil {
 				log.Warn("GetTopChangeRate 실패", zap.Error(err))
@@ -131,8 +131,6 @@ go func() {
 				continue
 			}
 
-			// 2. 인기 매매 비중 상위 10개 (홈페이지 파이차트)
-			//    비중(%)이 계산되어 RankingItem.BuyVolPct에 저장됨
 			topBuyVol, err := priceSvc.GetTopBuyVolume(broadcastCtx, 10)
 			if err != nil {
 				log.Warn("GetTopBuyVolume 실패", zap.Error(err))
@@ -144,8 +142,8 @@ go func() {
 
 				msg := map[string]interface{}{
 					"type":          "home_update",
-					"topChangeRate": topChangeRate, // 등락률 TOP 10
-					"topBuyVolume":  topBuyVol,     // 매수 비중 TOP 10 (BuyVolPct 포함)
+					"topChangeRate": topChangeRate, 
+					"topBuyVolume":  topBuyVol, 
 					"ts":            time.Now().UnixMilli(),
 				}
  
@@ -157,7 +155,7 @@ go func() {
 	}
 }()
 
-	// ── Echo HTTP Server ─────────────────────────────────────────────────────
+	// Echo HTTP Server
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
@@ -195,7 +193,7 @@ go func() {
 
 
 
-	// ── Graceful Shutdown ────────────────────────────────────────────────────
+	// Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-quit
@@ -204,10 +202,10 @@ go func() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 
-	_ = srv.Shutdown(shutCtx) // stop HTTP
-	extClient.Stop()           // stop KIS WS
-	cancelFn()                 // stop Kafka consumer goroutine
-	_ = orderConsumer.Stop()   // close reader
+	_ = srv.Shutdown(shutCtx) 
+	extClient.Stop() 
+	cancelFn()           
+	_ = orderConsumer.Stop() 
 	_ = execProducer.Disconnect()
 	authSvc.StopTokenScheduler()
 	rdb.Close()

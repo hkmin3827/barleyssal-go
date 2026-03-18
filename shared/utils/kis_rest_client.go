@@ -18,8 +18,6 @@ const (
 	kisMaxRetries     = 3
 )
 
-// KisRestClient enforces a per-call rate limit and retry logic when calling
-// the KIS REST API (mirrors kisRestClient.js).
 type KisRestClient struct {
 	mu         sync.Mutex
 	lastCallAt time.Time
@@ -27,7 +25,8 @@ type KisRestClient struct {
 	log        *zap.Logger
 }
 
-// NewKisRestClient creates a new KisRestClient.
+
+
 func NewKisRestClient(log *zap.Logger) *KisRestClient {
 	return &KisRestClient{
 		httpClient: &http.Client{Timeout: kisTimeoutMs},
@@ -35,7 +34,6 @@ func NewKisRestClient(log *zap.Logger) *KisRestClient {
 	}
 }
 
-// enforceRateLimit waits until at least kisRateLimitDelay has passed since the last call.
 func (c *KisRestClient) enforceRateLimit() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -47,8 +45,6 @@ func (c *KisRestClient) enforceRateLimit() {
 	c.lastCallAt = time.Now()
 }
 
-// FetchKisAPI performs a GET request to the KIS API with rate limiting and retries.
-// It returns the parsed JSON response as map[string]interface{}.
 func (c *KisRestClient) FetchKisAPI(ctx context.Context, url string, headers map[string]string) (map[string]interface{}, error) {
 	var lastErr error
 
@@ -89,13 +85,6 @@ func (c *KisRestClient) FetchKisAPI(ctx context.Context, url string, headers map
 			continue
 		}
 
-		// if resp.StatusCode >= 500 {
-		// 	lastErr = fmt.Errorf("KIS Server Error: %d", resp.StatusCode)
-		// 	if attempt < kisMaxRetries {
-		// 		time.Sleep(time.Duration(attempt) * time.Second)
-		// 	}
-		// 	continue
-		// }
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(resp.Body)

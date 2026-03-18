@@ -13,7 +13,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Redis key helpers (mirrors KEY object in matchingEngine.js)
 func priceKey(code string) string       { return "market:price:" + code }
 func pendingBuyKey(code string) string  { return "orders:pending:" + code + ":BUY" }
 func pendingSellKey(code string) string { return "orders:pending:" + code + ":SELL" }
@@ -30,8 +29,10 @@ type ExecutionEventParams struct {
 	AccountID     string
 	StockCode     string
 	OrderSide     string
+	OrderType 		string
 	ExecutedQty   string
 	ExecutedPrice float64
+	ExecutionStatus string
 }
 
 type OrderEvent struct {
@@ -40,10 +41,10 @@ type OrderEvent struct {
 	UserID     string `json:"userId"`
 	UserName   string `json:"userName"`
 	StockCode  string `json:"stockCode"`
-	OrderSide  string `json:"orderSide"` // "BUY" | "SELL"
-	OrderType  string `json:"orderType"` // "MARKET" | "LIMIT"
+	OrderSide  string `json:"orderSide"` 
+	OrderType  string `json:"orderType"` 
 	Quantity   string `json:"quantity"`
-	LimitPrice string `json:"limitPrice"` // nullable
+	LimitPrice string `json:"limitPrice"`
 }
 
 type OrderMeta struct {
@@ -53,11 +54,11 @@ type OrderMeta struct {
 	AccountID  string
 	StockCode  string
 	OrderSide  string
+	OrderType string
 	Quantity   string
 	LimitPrice string
 }
 
-// MatchingEngine processes incoming orders against live Redis prices.
 type MatchingEngine struct {
 	cfg      *config.Config
 	rdb      *redis.Client
@@ -66,7 +67,6 @@ type MatchingEngine struct {
 	log      *zap.Logger
 }
 
-// New creates a new MatchingEngine.
 func New(
 	cfg *config.Config,
 	rdb *redis.Client,
@@ -83,9 +83,6 @@ func New(
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OnOrderReceived — mirrors onOrderReceived
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (e *MatchingEngine) OnOrderReceived(ctx context.Context, event OrderEvent) error {
 	if event.OrderType == "MARKET" {
@@ -101,21 +98,15 @@ func (e *MatchingEngine) OnOrderReceived(ctx context.Context, event OrderEvent) 
 	return nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CheckLimitOrders — mirrors checkLimitOrders (exported for price-tick calls)
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (e *MatchingEngine) CheckLimitOrders(ctx context.Context, stockCode, tickPriceStr string) error {
 	currentPriceStr := tickPriceStr
 	if currentPriceStr == "" {
 		val, err := e.rdb.Get(ctx, priceKey(stockCode)).Result()
-		if err != nil {
+		if err != nil || val == "" {
 			return nil
 		}
 		currentPriceStr = val
-	}
-	if currentPriceStr == "" {
-		return nil
 	}
 	buyErr := e.matchOrders(ctx, stockCode, currentPriceStr, "BUY")
 	sellErr := e.matchOrders(ctx, stockCode, currentPriceStr, "SELL")
@@ -125,18 +116,28 @@ func (e *MatchingEngine) CheckLimitOrders(ctx context.Context, stockCode, tickPr
 	return sellErr
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// executeMarketOrder — mirrors executeMarketOrder
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (e *MatchingEngine) executeMarketOrder(ctx context.Context, event OrderEvent) error {
 	priceStr, err := e.rdb.Get(ctx, priceKey(event.StockCode)).Result()
+
 	if err != nil || priceStr == "" {
-		e.log.Warn("Market order failed: No current price in Redis cache.",
-			zap.String("orderId", event.OrderID),
-			zap.String("stockCode", event.StockCode))
-		return nil
+		e.log.Warn("Market order CANCELLED: No current price in Redis.", zap.String("orderId", event.OrderID))
+		return e.fireExecution(ctx, fireParams{
+			OrderID:       event.OrderID,
+			UserID:        event.UserID,
+			UserName:      event.UserName,
+			AccountID:     event.AccountID,
+			StockCode:     event.StockCode,
+			OrderSide:     event.OrderSide,
+			OrderType: 		event.OrderType,
+			Quantity:      "0",
+			ExecutedPrice: 	0,
+			ExecutionStatus: "CANCELLED",
+		})
 	}
+
+	execPrice, _ := strconv.ParseFloat(priceStr, 64)
+
 	return e.fireExecution(ctx, fireParams{
 		OrderID:       event.OrderID,
 		UserID:        event.UserID,
@@ -144,14 +145,13 @@ func (e *MatchingEngine) executeMarketOrder(ctx context.Context, event OrderEven
 		AccountID:     event.AccountID,
 		StockCode:     event.StockCode,
 		OrderSide:     event.OrderSide,
+		OrderType:		event.OrderType,
 		Quantity:      event.Quantity,
-		ExecutedPrice: priceStr,
+		ExecutedPrice: execPrice,
+		ExecutionStatus: "SUCCESS",
 	})
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// matchOrders — mirrors matchOrders
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (e *MatchingEngine) matchOrders(ctx context.Context, stockCode, currentPriceStr, orderSide string) error {
 	var zKey string
@@ -161,10 +161,17 @@ func (e *MatchingEngine) matchOrders(ctx context.Context, stockCode, currentPric
 		zKey = pendingSellKey(stockCode)
 	}
 
-	orderIDs, err := e.rdb.ZRangeByScore(ctx, zKey, &redis.ZRangeBy{
-		Min: currentPriceStr,
-		Max: currentPriceStr,
-	}).Result()
+	var rangeBy *redis.ZRangeBy
+
+if orderSide == "BUY" {
+    rangeBy = &redis.ZRangeBy{Min: currentPriceStr, Max: "+inf"}
+} else {
+    rangeBy = &redis.ZRangeBy{Min: "-inf", Max: currentPriceStr}
+}
+	
+	orderIDs, err := e.rdb.ZRangeByScore(ctx, zKey, rangeBy).Result()
+
+
 	if err != nil {
 		return fmt.Errorf("ZRangeByScore failed for %s: %w", zKey, err)
 	}
@@ -186,8 +193,11 @@ func (e *MatchingEngine) matchOrders(ctx context.Context, stockCode, currentPric
 			AccountID: rawMeta["accountId"],
 			StockCode: rawMeta["stockCode"],
 			OrderSide: rawMeta["orderSide"],
+			OrderType: rawMeta["orderType"],
 			Quantity:  rawMeta["quantity"],
 		}
+
+		execPrice, _ := strconv.ParseFloat(currentPriceStr, 64)
 
 		if err := e.fireExecution(ctx, fireParams{
 			OrderID:       meta.OrderID,
@@ -196,8 +206,10 @@ func (e *MatchingEngine) matchOrders(ctx context.Context, stockCode, currentPric
 			AccountID:     meta.AccountID,
 			StockCode:     meta.StockCode,
 			OrderSide:     meta.OrderSide,
+			OrderType: 		meta.OrderType,
 			Quantity:      meta.Quantity,
-			ExecutedPrice: currentPriceStr,
+			ExecutedPrice: execPrice,
+			ExecutionStatus: "SUCCESS",
 		}); err != nil {
 			e.log.Error("Order matching failed",
 				zap.String("orderId", orderID),
@@ -210,10 +222,6 @@ func (e *MatchingEngine) matchOrders(ctx context.Context, stockCode, currentPric
 	return nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// fireExecution — mirrors fireExecution
-// ─────────────────────────────────────────────────────────────────────────────
-
 type fireParams struct {
 	OrderID       string
 	UserID        string
@@ -221,31 +229,32 @@ type fireParams struct {
 	AccountID     string
 	StockCode     string
 	OrderSide     string
+	OrderType			string
 	Quantity      string
-	ExecutedPrice string
+	ExecutedPrice float64
+	ExecutionStatus string
 }
 
 func (e *MatchingEngine) fireExecution(ctx context.Context, p fireParams) error {
-	execPrice, err := strconv.ParseFloat(p.ExecutedPrice, 64)
-	if err != nil {
-		return fmt.Errorf("invalid executed price %q: %w", p.ExecutedPrice, err)
-	}
 
-	if err := e.producer.PublishExecutionEvent(ctx, ExecutionEventParams{
+	err := e.producer.PublishExecutionEvent(ctx, ExecutionEventParams{
 		OrderID:       p.OrderID,
 		UserID:        p.UserID,
 		UserName:      p.UserName,
 		AccountID:     p.AccountID,
 		StockCode:     p.StockCode,
 		OrderSide:     p.OrderSide,
+		OrderType:		p.OrderType,
 		ExecutedQty:   p.Quantity,
-		ExecutedPrice: execPrice,
-	}); err != nil {
-		return fmt.Errorf("publishExecutionEvent failed: %w", err)
-	}
+		ExecutedPrice: p.ExecutedPrice,
+		ExecutionStatus: p.ExecutionStatus,
+	})
+
+	noticeType := "EXECUTION"
+	if p.ExecutionStatus == "CANCELLED" { noticeType = "ORDER_CANCELLED" }
 
 	e.notifier.NotifyExecution(map[string]interface{}{
-		"type":             "EXECUTION",
+		"type":             noticeType,
 		"orderId":          p.OrderID,
 		"userId":           p.UserID,
 		"userName":         p.UserName,
@@ -255,12 +264,13 @@ func (e *MatchingEngine) fireExecution(ctx context.Context, p fireParams) error 
 		"executedQuantity": p.Quantity,
 		"ts":               time.Now().UnixMilli(),
 	})
-
 	e.log.Info("Order executed",
 		zap.String("orderId", p.OrderID),
 		zap.String("stockCode", p.StockCode),
 		zap.String("side", p.OrderSide),
-		zap.String("executedPrice", p.ExecutedPrice),
-		zap.String("qty", p.Quantity))
-	return nil
+		zap.Float64("executedPrice", p.ExecutedPrice),
+    zap.String("qty", p.Quantity),
+    zap.String("status", p.ExecutionStatus),
+)
+	return err
 }

@@ -31,6 +31,7 @@ type StockInfo struct {
 	StockCode  string   `json:"stockCode"`
 	StockName  string   `json:"stockName"`
 	Price      float64 `json:"price"`
+	PrdyVrssSign int64 `json:"prdyVrssSign"`
 	PrdyVrss   float64 `json:"prdyVrss"`  
 	ChangeRate float64 `json:"changeRate"`
 	AcmlVol     float64  `json:"acmlVol"`
@@ -41,7 +42,7 @@ type RankingItem struct {
 	StockName  string  `json:"stockName"`
 	Price      float64 `json:"price"`
 	ChangeRate float64 `json:"changeRate"`
-	BuyVolPct  float64 `json:"buyVolPct,omitempty"` // 매수 비중 % (todayBuyVolume 랭킹용)
+	BuyVolPct  float64 `json:"buyVolPct,omitempty"` 
 }
 
 type PriceService struct {
@@ -71,12 +72,14 @@ func (s *PriceService) OnPriceUpdate(
 		price float64,
 		changeRate float64,
 		volume int64,
+		prdyVrssSign int64,
 		prdyVrss float64,
 		stckOprc float64,
 		stckHgpr float64,
 		stckLwpr float64,
 		acmlVol int64,
 		eventTime time.Time,
+		mkopCode string,
 	) error {
 	if stockCode == "" || math.IsNaN(price) || price <= 0 {
 		return nil
@@ -92,12 +95,14 @@ func (s *PriceService) OnPriceUpdate(
 	pipe.HSet(ctx, infoKey(stockCode), map[string]interface{}{
 		"price":      price,
 		"changeRate": changeRate,
+		"prdyVrssSign": prdyVrssSign,
 		"prdyVrss":   prdyVrss,    // 전일 대비 (원)
 		"stckOprc":   stckOprc,    // 시가
 		"stckHgpr":   stckHgpr,    // 고가
 		"stckLwpr":   stckLwpr,    // 저가
 		"acmlVol":    acmlVol,     // 누적 거래량
 		"volume":     volume,      // 단일 체결량 (chartSvc 호환 유지)
+		"mKopCode":   mkopCode,    // 신 장운영 구분 코드
 	})
 	pipe.Expire(ctx, infoKey(stockCode), time.Duration(s.cfg.Cache.InfoTTL)*time.Second)
  
@@ -121,12 +126,10 @@ func (s *PriceService) OnPriceUpdate(
 	return nil
 }
 
-// UpdateBuyVolume: 매수 누적 거래량 갱신 (KIS 웹소켓 shnuCntgSmtn 필드)
 func (s *PriceService) UpdateBuyVolume(ctx context.Context, stockCode string, shnuCntgSmtn float64) {
 	if stockCode == "" || shnuCntgSmtn <= 0 {
 		return
 	}
-	// ZADD는 member가 이미 있으면 score를 덮어씀 (upsert)
 	if err := s.rdb.ZAdd(ctx, zsetBuyVolume, redis.Z{
 		Score:  shnuCntgSmtn,
 		Member: stockCode,
@@ -141,7 +144,6 @@ func (s *PriceService) GetTopChangeRate(ctx context.Context, topN int) ([]Rankin
 
 
 func (s *PriceService) GetTopBuyVolume(ctx context.Context, topN int) ([]RankingItem, error) {
-	// 상위 N개 코드 + score 조회
 	results, err := s.rdb.ZRevRangeWithScores(ctx, zsetBuyVolume, 0, int64(topN-1)).Result()
 	if err != nil || len(results) == 0 {
 		return nil, err
@@ -177,21 +179,37 @@ func (s *PriceService) GetTopVolume(ctx context.Context, topN int) ([]StockInfo,
 }
  
 
-
 func (s *PriceService) GetSortedStocks(ctx context.Context, sortKey string) ([]StockInfo, error) {
 	switch sortKey {
 	case "changeRate":
 		return s.getSortedStocksFull(ctx, zsetChangeRate)
 	case "acmlVol":
 		return s.getSortedStocksFull(ctx, zsetAcmlVolume)
+	case "name":
+		return s.getSortedByName(ctx)
 	default:
-		// "name" 등 미지원 → 프론트엔드에서 처리하므로 호출되면 안 됨
 		return nil, fmt.Errorf("unsupported sort key: %s", sortKey)
 	}
 }
 
+func (s *PriceService) getSortedByName(ctx context.Context) ([]StockInfo, error) {
+	codes := make([]string, 0, len(config.KoreaStocks))
+	for _, st := range config.KoreaStocks {
+		if st.Code != "" {
+			codes = append(codes, st.Code)
+		}
+	}
+	items, err := s.fetchStockInfoBatch(ctx, codes)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].StockName < items[j].StockName
+	})
+	return items, nil
+}
+
 func (s *PriceService) getSortedStocksFull(ctx context.Context, zsetKey string) ([]StockInfo, error) {
-	// ZREVRANGE 0 -1 : 전체 코드를 score 내림차순으로 가져옴 — O(N log N) 정렬 불필요
 	codes, err := s.rdb.ZRevRange(ctx, zsetKey, 0, -1).Result()
 	if err != nil {
 		return nil, fmt.Errorf("ZREVRANGE %s: %w", zsetKey, err)
@@ -203,12 +221,10 @@ func (s *PriceService) getSortedStocksFull(ctx context.Context, zsetKey string) 
 }
 
 func (s *PriceService) fetchStockInfoBatch(ctx context.Context, codes []string) ([]StockInfo, error) {
-	// 코드 → 종목명 맵 (config에서 O(N) 조회 → 실제 서비스는 map으로 캐싱 권장)
 	nameMap := buildNameMap()
  
 	pipe := s.rdb.Pipeline()
-	// HMGET: 필요한 필드만 지정 → 불필요한 데이터 전송 제거
-	fields := []string{"price", "changeRate", "prdyVrss", "acmlVol"}
+	fields := []string{"price", "changeRate", "prdyVrssSign", "prdyVrss", "acmlVol"}
 	cmds := make([]*redis.SliceCmd, len(codes))
 	for i, code := range codes {
 		cmds[i] = pipe.HMGet(ctx, infoKey(code), fields...)
@@ -224,11 +240,12 @@ func (s *PriceService) fetchStockInfoBatch(ctx context.Context, codes []string) 
 			StockCode: code,
 			StockName: nameMap[code],
 		}
-		if len(vals) >= 4 {
+		if len(vals) >= 5 {
 			item.Price = parseF64(vals[0])
 			item.ChangeRate = parseF64(vals[1])
-			item.PrdyVrss = parseF64(vals[2])
-			item.AcmlVol = parseF64(vals[3])
+			item.PrdyVrssSign = parseInt64(vals[2])
+			item.PrdyVrss = parseF64(vals[3])
+			item.AcmlVol = parseF64(vals[4])
 		}
 		results = append(results, item)
 	}
@@ -236,7 +253,6 @@ func (s *PriceService) fetchStockInfoBatch(ctx context.Context, codes []string) 
 }
 
 
-// fetchInfoBatch: RankingItem용 경량 조회 (브로드캐스트 전용)
 func (s *PriceService) fetchInfoBatch(ctx context.Context, codes []string) ([]RankingItem, error) {
 	nameMap := buildNameMap()
 	pipe := s.rdb.Pipeline()
@@ -272,7 +288,6 @@ func (s *PriceService) getTopFromZSet(ctx context.Context, zsetKey string, topN 
 
 
 
-// RegisterStocks: 서버 시작 시 감시 종목 목록을 Redis에 등록 (HSetNX로 기존 값 보존)
 func (s *PriceService) RegisterStocks(ctx context.Context, codes []string) error {
 	if len(codes) == 0 {
 		return nil
@@ -287,6 +302,13 @@ func (s *PriceService) RegisterStocks(ctx context.Context, codes []string) error
 	return err
 }
 
+func (s *PriceService) GetStocksBatch(ctx context.Context, codes []string) ([]StockInfo, error) {
+	if len(codes) == 0 {
+		return []StockInfo{}, nil
+	}
+	return s.fetchStockInfoBatch(ctx, codes)
+}
+ 
 
 func (s *PriceService) GetCurrentPrice(ctx context.Context, stockCode string) (*float64, error) {
 	if stockCode == "" {
@@ -306,45 +328,25 @@ func (s *PriceService) GetCurrentPrice(ctx context.Context, stockCode string) (*
 	return &p, nil
 }
 
-// GetStockInfo: StockDetailPage 초기 seed용 — market:info:<code> 전체 조회
-func (s *PriceService) GetStockInfo(ctx context.Context, stockCode string) (map[string]float64, error) {
-	fields := []string{"price", "changeRate", "prdyVrss", "stckOprc", "stckHgpr", "stckLwpr", "acmlVol", "cntgVol"}
-	vals, err := s.rdb.HMGet(ctx, infoKey(stockCode), fields...).Result()
+
+func (s *PriceService) GetStockInfo(ctx context.Context, stockCode string) (map[string]float64, string, error) {
+	numFields := []string{"price", "changeRate", "prdyVrssSign", "prdyVrss", "stckOprc", "stckHgpr", "stckLwpr", "acmlVol", "cntgVol"}
+	allFields := append(numFields, "mKopCode")
+	vals, err := s.rdb.HMGet(ctx, infoKey(stockCode), allFields...).Result()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	result := make(map[string]float64, len(fields))
-	for i, f := range fields {
+	result := make(map[string]float64, len(numFields))
+	for i, f := range numFields {
 		result[f] = parseF64(vals[i])
 	}
-	return result, nil
+	mkopCode := ""
+	if len(vals) > len(numFields) && vals[len(numFields)] != nil {
+		mkopCode, _ = vals[len(numFields)].(string)
+	}
+	return result, mkopCode, nil
 }
 
-func parseF64(v interface{}) float64 {
-	if v == nil {
-		return 0
-	}
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	f, _ := strconv.ParseFloat(s, 64)
-	return f
-}
- 
-func parseInt64(v interface{}) int64 {
-	if v == nil {
-		return 0
-	}
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	i, _ := strconv.ParseInt(s, 10, 64)
-	return i
-}
-
-// SearchStocks: 이름/코드로 검색 후 거래량 내림차순 정렬하여 반환
 func (s *PriceService) SearchStocks(ctx context.Context, query string, limit int) ([]StockInfo, error) {
 	if limit <= 0 {
 		limit = 40
@@ -389,7 +391,6 @@ func (s *PriceService) SearchStocks(ctx context.Context, query string, limit int
 		results = append(results, item)
 	}
 
-	// 거래량 내림차순 정렬
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].AcmlVol > results[j].AcmlVol
 	})
@@ -402,6 +403,8 @@ func (s *PriceService) SearchStocks(ctx context.Context, query string, limit int
 
 var stockNameMap map[string]string
  
+
+
 func init() {
 	stockNameMap = make(map[string]string, len(config.KoreaStocks))
 	for _, s := range config.KoreaStocks {
@@ -411,4 +414,28 @@ func init() {
 
 func buildNameMap() map[string]string {
 	return stockNameMap
+}
+
+func parseF64(v interface{}) float64 {
+	if v == nil {
+		return 0
+	}
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
+}
+ 
+func parseInt64(v interface{}) int64 {
+	if v == nil {
+		return 0
+	}
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	i, _ := strconv.ParseInt(s, 10, 64)
+	return i
 }
