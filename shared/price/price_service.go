@@ -13,6 +13,7 @@ import (
 	chartapp "barleyssal-go/domains/chart/application"
 	matchingapp "barleyssal-go/domains/order_matching/application"
 	pnlapp "barleyssal-go/domains/pnl/application"
+	"barleyssal-go/shared/ports"
 
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -23,8 +24,8 @@ func infoKey(code string) string   { return "market:info:" + code }
 
 const (
 	zsetChangeRate = "market:ranking:todayChangeRate" // score: 등락률(%)
-	zsetBuyVolume  = "market:ranking:todayBuyVolume"  // score: 매수 누적 체결량
-	zsetAcmlVolume     = "market:ranking:acmlVolume"           // score: 누적 거래량
+	zsetBuyVolume  = "market:ranking:todayBuyVolume"  // score: 금일 매수 누적 체결량
+	zsetAcmlVolume     = "market:ranking:acmlVolume" // score: 누적 거래량
 )
 
 type StockInfo struct {
@@ -80,14 +81,14 @@ func (s *PriceService) OnPriceUpdate(
 		acmlVol int64,
 		eventTime time.Time,
 		mkopCode string,
-	) error {
+	) (ports.BarEvent, error) {
 	if stockCode == "" || math.IsNaN(price) || price <= 0 {
-		return nil
+		return ports.BarEvent{}, nil
 	}
 
 	pipe := s.rdb.Pipeline()
 
-	priceStr := strconv.FormatFloat(price, 'f', -1, 64)  // 매칭엔진용
+	priceStr := strconv.FormatFloat(price, 'f', -1, 64) 
 
 	pipe.Set(ctx, priceKey(stockCode), priceStr, time.Duration(s.cfg.Cache.PriceTTL)*time.Second)
 
@@ -105,16 +106,16 @@ func (s *PriceService) OnPriceUpdate(
 		"mKopCode":   mkopCode,    // 신 장운영 구분 코드
 	})
 	pipe.Expire(ctx, infoKey(stockCode), time.Duration(s.cfg.Cache.InfoTTL)*time.Second)
- 
+
 
 	pipe.ZAdd(ctx, zsetChangeRate, redis.Z{Score: changeRate, Member: stockCode})
 	pipe.ZAdd(ctx, zsetAcmlVolume, redis.Z{Score: float64(acmlVol), Member: stockCode})
 
-	s.chartSvc.UpdateOhlcvBuffer(ctx, stockCode, price, float64(volume), pipe, eventTime)
-
+	liveBar := s.chartSvc.UpdateOhlcvBuffer(ctx, stockCode, price, float64(volume), pipe, eventTime)
+	
 	if _, err := pipe.Exec(ctx); err != nil {
 		s.log.Warn("price pipeline exec failed", zap.String("code", stockCode), zap.Error(err))
-		return err
+		return ports.BarEvent{}, err
 	}
 
 	if err := s.matchEng.CheckLimitOrders(ctx, stockCode, priceStr); err != nil {
@@ -123,7 +124,7 @@ func (s *PriceService) OnPriceUpdate(
 
 	s.pnlSvc.OnPriceUpdate(stockCode, price)
 
-	return nil
+	return liveBar, nil
 }
 
 func (s *PriceService) UpdateBuyVolume(ctx context.Context, stockCode string, shnuCntgSmtn float64) {
@@ -139,16 +140,21 @@ func (s *PriceService) UpdateBuyVolume(ctx context.Context, stockCode string, sh
 }
 
 func (s *PriceService) GetTopChangeRate(ctx context.Context, topN int) ([]RankingItem, error) {
-	return s.getTopFromZSet(ctx, zsetChangeRate, topN, false)
+	return s.getTopFromZSet(ctx, zsetChangeRate, topN)
 }
 
 
 func (s *PriceService) GetTopBuyVolume(ctx context.Context, topN int) ([]RankingItem, error) {
-	results, err := s.rdb.ZRevRangeWithScores(ctx, zsetBuyVolume, 0, int64(topN-1)).Result()
+		results, err := s.rdb.ZRangeArgsWithScores(ctx, redis.ZRangeArgs{
+		Key:   zsetBuyVolume,
+		Start: 0,
+		Stop:  int64(topN - 1),
+		Rev:   true,
+	}).Result()
 	if err != nil || len(results) == 0 {
 		return nil, err
 	}
- 
+
 	allScores, err := s.rdb.ZRangeWithScores(ctx, zsetBuyVolume, 0, -1).Result()
 	var total float64
 	if err == nil {
@@ -156,7 +162,7 @@ func (s *PriceService) GetTopBuyVolume(ctx context.Context, topN int) ([]Ranking
 			total += z.Score
 		}
 	}
- 
+
 	codes := make([]string, len(results))
 	for i, z := range results {
 		codes[i] = z.Member.(string)
@@ -165,7 +171,7 @@ func (s *PriceService) GetTopBuyVolume(ctx context.Context, topN int) ([]Ranking
 	if err != nil {
 		return nil, err
 	}
- 
+
 	for i := range items {
 		if total > 0 {
 			items[i].BuyVolPct = (results[i].Score / total) * 100
@@ -173,11 +179,6 @@ func (s *PriceService) GetTopBuyVolume(ctx context.Context, topN int) ([]Ranking
 	}
 	return items, nil
 }
- 
-func (s *PriceService) GetTopVolume(ctx context.Context, topN int) ([]StockInfo, error) {
-	return s.getSortedStocksFull(ctx, zsetAcmlVolume)
-}
- 
 
 func (s *PriceService) GetSortedStocks(ctx context.Context, sortKey string) ([]StockInfo, error) {
 	switch sortKey {
@@ -210,9 +211,14 @@ func (s *PriceService) getSortedByName(ctx context.Context) ([]StockInfo, error)
 }
 
 func (s *PriceService) getSortedStocksFull(ctx context.Context, zsetKey string) ([]StockInfo, error) {
-	codes, err := s.rdb.ZRevRange(ctx, zsetKey, 0, -1).Result()
+	codes, err := s.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+				Key:   zsetKey,
+				Start: 0,
+				Stop:  -1,
+				Rev:   true,
+			}).Result()
 	if err != nil {
-		return nil, fmt.Errorf("ZREVRANGE %s: %w", zsetKey, err)
+		return nil, fmt.Errorf("ZRANGE %s: %w", zsetKey, err)
 	}
 	if len(codes) == 0 {
 		return []StockInfo{}, nil
@@ -222,7 +228,6 @@ func (s *PriceService) getSortedStocksFull(ctx context.Context, zsetKey string) 
 
 func (s *PriceService) fetchStockInfoBatch(ctx context.Context, codes []string) ([]StockInfo, error) {
 	nameMap := buildNameMap()
- 
 	pipe := s.rdb.Pipeline()
 	fields := []string{"price", "changeRate", "prdyVrssSign", "prdyVrss", "acmlVol"}
 	cmds := make([]*redis.SliceCmd, len(codes))
@@ -232,7 +237,7 @@ func (s *PriceService) fetchStockInfoBatch(ctx context.Context, codes []string) 
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("pipeline HMGET: %w", err)
 	}
- 
+
 	results := make([]StockInfo, 0, len(codes))
 	for i, code := range codes {
 		vals := cmds[i].Val()
@@ -252,7 +257,6 @@ func (s *PriceService) fetchStockInfoBatch(ctx context.Context, codes []string) 
 	return results, nil
 }
 
-
 func (s *PriceService) fetchInfoBatch(ctx context.Context, codes []string) ([]RankingItem, error) {
 	nameMap := buildNameMap()
 	pipe := s.rdb.Pipeline()
@@ -264,7 +268,7 @@ func (s *PriceService) fetchInfoBatch(ctx context.Context, codes []string) ([]Ra
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, err
 	}
- 
+
 	items := make([]RankingItem, 0, len(codes))
 	for i, code := range codes {
 		vals := cmds[i].Val()
@@ -278,15 +282,18 @@ func (s *PriceService) fetchInfoBatch(ctx context.Context, codes []string) ([]Ra
 	return items, nil
 }
 
-func (s *PriceService) getTopFromZSet(ctx context.Context, zsetKey string, topN int, _ bool) ([]RankingItem, error) {
-	codes, err := s.rdb.ZRevRange(ctx, zsetKey, 0, int64(topN-1)).Result()
+func (s *PriceService) getTopFromZSet(ctx context.Context, zsetKey string, topN int) ([]RankingItem, error) {
+	codes, err := s.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+			Key:    zsetKey,
+			Start:  0,
+			Stop:   int64(topN - 1),
+			Rev:    true,
+	}).Result()
 	if err != nil || len(codes) == 0 {
-		return nil, err
+			return nil, err
 	}
 	return s.fetchInfoBatch(ctx, codes)
 }
-
-
 
 func (s *PriceService) RegisterStocks(ctx context.Context, codes []string) error {
 	if len(codes) == 0 {
@@ -308,7 +315,6 @@ func (s *PriceService) GetStocksBatch(ctx context.Context, codes []string) ([]St
 	}
 	return s.fetchStockInfoBatch(ctx, codes)
 }
- 
 
 func (s *PriceService) GetCurrentPrice(ctx context.Context, stockCode string) (*float64, error) {
 	if stockCode == "" {
@@ -328,9 +334,8 @@ func (s *PriceService) GetCurrentPrice(ctx context.Context, stockCode string) (*
 	return &p, nil
 }
 
-
 func (s *PriceService) GetStockInfo(ctx context.Context, stockCode string) (map[string]float64, string, error) {
-	numFields := []string{"price", "changeRate", "prdyVrssSign", "prdyVrss", "stckOprc", "stckHgpr", "stckLwpr", "acmlVol", "cntgVol"}
+	numFields := []string{"price", "changeRate", "prdyVrssSign", "prdyVrss", "stckOprc", "stckHgpr", "stckLwpr", "acmlVol", "volume"}
 	allFields := append(numFields, "mKopCode")
 	vals, err := s.rdb.HMGet(ctx, infoKey(stockCode), allFields...).Result()
 	if err != nil {
@@ -366,7 +371,7 @@ func (s *PriceService) SearchStocks(ctx context.Context, query string, limit int
 	}
 
 	pipe := s.rdb.Pipeline()
-	fields := []string{"price", "changeRate", "prdyVrss", "acmlVol"}
+	fields := []string{"price", "changeRate", "prdyVrss", "acmlVol", "prdyVrssSign"}
 	infoCmds := make([]*redis.SliceCmd, len(targets))
 	for i, st := range targets {
 		infoCmds[i] = pipe.HMGet(ctx, infoKey(st.Code), fields...)
@@ -382,11 +387,12 @@ func (s *PriceService) SearchStocks(ctx context.Context, query string, limit int
 			StockCode: st.Code,
 			StockName: st.Name,
 		}
-		if len(vals) >= 4 {
+		if len(vals) >= 5 {
 			item.Price = parseF64(vals[0])
 			item.ChangeRate = parseF64(vals[1])
 			item.PrdyVrss = parseF64(vals[2])
 			item.AcmlVol = parseF64(vals[3])
+			item.PrdyVrssSign = parseInt64(vals[4])
 		}
 		results = append(results, item)
 	}
@@ -402,7 +408,7 @@ func (s *PriceService) SearchStocks(ctx context.Context, query string, limit int
 }
 
 var stockNameMap map[string]string
- 
+
 
 
 func init() {
@@ -427,15 +433,18 @@ func parseF64(v interface{}) float64 {
 	f, _ := strconv.ParseFloat(s, 64)
 	return f
 }
- 
+
 func parseInt64(v interface{}) int64 {
-	if v == nil {
-		return 0
+	if v == nil { return 0 }
+	switch val := v.(type) {
+	case string:
+			i, _ := strconv.ParseInt(val, 10, 64)
+			return i
+	case int64:
+			return val
+	case int:
+			return int64(val)
+	default:
+			return 0
 	}
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	i, _ := strconv.ParseInt(s, 10, 64)
-	return i
 }

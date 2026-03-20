@@ -1,16 +1,16 @@
 package httphandler
 
 import (
-	"encoding/json"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	chartapplication "barleyssal-go/domains/chart/application"
+	pnlApplication "barleyssal-go/domains/pnl/application"
 	wshub "barleyssal-go/shared/infrastructure/websocket"
 	"barleyssal-go/shared/price"
+	"barleyssal-go/shared/session"
 	"barleyssal-go/shared/utils"
 
 	"github.com/labstack/echo/v4"
@@ -21,19 +21,23 @@ import (
 type Handler struct {
 	chartSvc *chartapplication.ChartService
 	priceSvc *price.PriceService
+	pnlSvc   *pnlApplication.PnlService
 	rdb      *redis.Client
 	hub      *wshub.Hub
 	log      *zap.Logger
+	sessionRes *session.Resolver
 }
 
 func New(
 	chartSvc *chartapplication.ChartService,
 	priceSvc *price.PriceService,
+	pnlSvc *pnlApplication.PnlService,
 	rdb *redis.Client,
 	hub *wshub.Hub,
 	log *zap.Logger,
+	sessionRes *session.Resolver,
 ) *Handler {
-	return &Handler{chartSvc: chartSvc, priceSvc: priceSvc, rdb: rdb, hub: hub, log: log}
+	return &Handler{chartSvc: chartSvc, priceSvc: priceSvc, pnlSvc: pnlSvc, rdb: rdb, hub: hub, log: log, sessionRes: sessionRes}
 }
 
 func (h *Handler) RegisterRoutes(e *echo.Echo) {
@@ -127,14 +131,13 @@ func (h *Handler) getStockInfo(c echo.Context) error {
 		"stckOprc":   info["stckOprc"],
 		"stckHgpr":   info["stckHgpr"],
 		"stckLwpr":   info["stckLwpr"],
-		"volume":     info["volume"],  // 체결 거래량 (cntg_vol)
+		"volume":     info["volume"],
 		"acmlVol":    int64(info["acmlVol"]),
 		"mKopCode":   mkopCode,
 		"ts":         time.Now().UnixMilli(),
 	})
 }
  
-
 func (h *Handler) getPeriodChart(c echo.Context) error {
 	stockCode := strings.ToUpper(c.Param("stockCode"))
 	if stockCode == "" {
@@ -176,7 +179,6 @@ func (h *Handler) getIntraDayChart(c echo.Context) error {
 }
 
 
-
 func (h *Handler) searchStocks(c echo.Context) error {
 	q := c.QueryParam("q")
 	limit := 20
@@ -191,83 +193,12 @@ func (h *Handler) searchStocks(c echo.Context) error {
 }
 
 func (h *Handler) getAccountPnl(c echo.Context) error {
-	ctx := c.Request().Context()
-	userID := c.Param("userId")
-
-	status, err := h.rdb.HGetAll(ctx, "account:status:"+userID).Result()
-	if err != nil || status["deposit"] == "" || status["principal"] == "" {
-		return c.JSON(http.StatusNotFound, echo.Map{"error": "Account not found"})
-	}
-
-	deposit, _ := strconv.ParseFloat(status["deposit"], 64)
-	principal, _ := strconv.ParseFloat(status["principal"], 64)
-	holdingsMeta, _ := h.rdb.HGetAll(ctx, "account:holdings:meta:"+userID).Result()
-
-	type holdingResp struct {
-		StockCode    string  `json:"stockCode"`
-		TotalQty     int64   `json:"totalQty"`
-		AvgPrice     float64 `json:"avgPrice"`
-		CurrentPrice float64 `json:"currentPrice"`
-		HoldValue    float64 `json:"holdValue"`
-		PnlRate      float64 `json:"pnlRate"`
-	}
-
-	var stockValue float64
-	var totalCostBasis float64
-	holdings := make([]holdingResp, 0, len(holdingsMeta))
-
-	for code, metaStr := range holdingsMeta {
-		var meta struct {
-			TotalQuantity string `json:"totalQuantity"`
-			AvgPrice      string `json:"avgPrice"`
-		}
-		if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
-			continue
-		}
-		totalQty, _ := strconv.ParseInt(meta.TotalQuantity, 10, 64)
-		if totalQty <= 0 {
-			continue
-		}
-
-		avgPrice, _ := strconv.ParseFloat(meta.AvgPrice, 64)
-		var currentPrice float64
-		if p, _ := h.priceSvc.GetCurrentPrice(ctx, code); p != nil {
-			currentPrice = *p
-		} else {
-			currentPrice = avgPrice
-		}
-
-		holdValue := currentPrice * float64(totalQty)
-		var pnlRate float64
-		if avgPrice > 0 {
-			pnlRate = ((currentPrice - avgPrice) / avgPrice) * 100
-		}
-		stockValue += holdValue
-		totalCostBasis += avgPrice * float64(totalQty)
-		holdings = append(holdings, holdingResp{
-			StockCode:    code,
-			TotalQty:     totalQty,
-			AvgPrice:     avgPrice,
-			CurrentPrice: currentPrice,
-			HoldValue:    holdValue,
-			PnlRate:      math.Round(pnlRate*100) / 100,
-		})
-	}
-
-	realtimeTotalEquity := deposit + stockValue
-	var totalPnlRate float64
-	if totalCostBasis > 0 {
-		totalPnlRate = ((stockValue - totalCostBasis) / totalCostBasis) * 100
-	}
-	return c.JSON(http.StatusOK, echo.Map{
-		"userId":              userID,
-		"deposit":             deposit,
-		"principal":           principal,
-		"stockValue":          stockValue,
-		"realtimeTotalEquity": math.Round(realtimeTotalEquity*100) / 100,
-		"totalPnlRate":        math.Round(totalPnlRate*100) / 100,
-		"holdings":            holdings,
-	})
+    userID := c.Param("userId")
+    snapshot, err := h.pnlSvc.CalcSnapshot(c.Request().Context(), userID)
+    if err != nil || snapshot == nil {
+        return c.JSON(http.StatusNotFound, echo.Map{"error": "Account not found"})
+    }
+    return c.JSON(http.StatusOK, snapshot)
 }
 
 func (h *Handler) health(c echo.Context) error {

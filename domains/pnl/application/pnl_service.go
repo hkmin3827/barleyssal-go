@@ -1,4 +1,3 @@
-// Package pnlapplication computes real-time PnL and pushes results over WebSocket.
 package pnlapplication
 
 import (
@@ -146,9 +145,64 @@ func (s *PnlService) OnPriceUpdate(stockCode string, currentPrice float64) {
 }
 
 func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPrice float64, triggerCode string) error {
+
+	snapshot, err := s.CalcSnapshot(ctx, userID)
+
+	if err != nil { return err }
+	if snapshot == nil {
+		return nil
+	}
+
+	if triggerCode != "" && triggerPrice > 0 {
+		for i := range snapshot.Holdings {
+			h := &snapshot.Holdings[i]
+			if h.StockCode != triggerCode {
+				continue
+			}
+
+			oldHoldValue := h.HoldValue
+			oldPnlAmount := h.PnlAmount
+
+			newHoldValue := triggerPrice * float64(h.TotalQuantity)
+			newPnlAmount := (triggerPrice - h.AvgPrice) * float64(h.TotalQuantity)
+			var newPnlRate float64
+			if h.AvgPrice > 0 {
+				newPnlRate = ((triggerPrice - h.AvgPrice) / h.AvgPrice) * 100
+			}
+			
+			h.CurrentPrice = triggerPrice
+			h.HoldValue = round2(newHoldValue)
+			h.PnlAmount = round2(newPnlAmount)
+			h.PnlRate = round2(newPnlRate)
+
+
+			newStockValue := snapshot.StockValue - oldHoldValue + newHoldValue
+			snapshot.StockValue = round2(newStockValue)
+			snapshot.TotalPnlAmount = round2(snapshot.TotalPnlAmount - oldPnlAmount + newPnlAmount)
+			snapshot.RealtimeTotalEquity = round2(snapshot.Deposit + newStockValue)
+
+
+			var totalCostBasis float64
+			for _, h2 := range snapshot.Holdings {
+				totalCostBasis += h2.AvgPrice * float64(h2.TotalQuantity)
+			}
+			if totalCostBasis > 0 {
+				snapshot.TotalPnlRate = round2((newStockValue - totalCostBasis) / totalCostBasis * 100)
+			}
+ 
+			snapshot.Ts = time.Now().UnixMilli()
+			break
+		}
+	}
+	s.notifier.PushToUser(userID, snapshot)
+	return nil
+}
+
+
+func (s *PnlService) CalcSnapshot(ctx context.Context, userID string) (*PnlUpdatePayload, error) {
 	status, err := s.rdb.HGetAll(ctx, "account:status:"+userID).Result()
 	if err != nil || status["deposit"] == "" || status["principal"] == "" {
-		return nil
+		return nil, nil
 	}
 
 	deposit, _ := strconv.ParseFloat(status["deposit"], 64)
@@ -156,7 +210,7 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 
 	holdingsMeta, err := s.rdb.HGetAll(ctx, "account:holdings:meta:"+userID).Result()
 	if err != nil {
-		return fmt.Errorf("holdings meta: %w", err)
+		return nil, fmt.Errorf("holdings meta: %w", err)
 	}
 
 	codes := make([]string, 0, len(holdingsMeta))
@@ -184,9 +238,7 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		}
 	}
 
-	var stockValue float64
-	var totalCostBasis float64
-	var totalPnlAmount float64
+	var stockValue, totalCostBasis, totalPnlAmount float64
 	holdingDetails := make([]HoldingDetail, 0, len(holdingsMeta))
 
 	for code, metaStr := range holdingsMeta {
@@ -201,13 +253,9 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 
 		avgPrice, _ := strconv.ParseFloat(meta.AvgPrice, 64)
 
-		var currentPrice float64
-		if code == triggerCode && triggerPrice > 0 {
-			currentPrice = triggerPrice
-		} else if p, ok := redisPrice[code]; ok {
+		currentPrice := avgPrice
+		if p, ok := redisPrice[code]; ok {
 			currentPrice = p
-		} else {
-			currentPrice = avgPrice
 		}
 
 		holdValue := currentPrice * float64(totalQty)
@@ -224,13 +272,13 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		totalPnlAmount += pnlAmount
 
 		holdingDetails = append(holdingDetails, HoldingDetail{
-			StockCode:     code,
+			StockCode: code,
 			TotalQuantity: totalQty,
-			AvgPrice:      avgPrice,
-			CurrentPrice:  currentPrice,
-			HoldValue:     holdValue,
-			PnlAmount:     math.Round(pnlAmount*100) / 100,
-			PnlRate:       math.Round(pnlRate*100) / 100,
+			AvgPrice: avgPrice,
+			CurrentPrice: currentPrice,
+			HoldValue: holdValue,
+			PnlAmount: round2(pnlAmount),
+			PnlRate: round2(pnlRate),
 		})
 	}
 
@@ -245,21 +293,18 @@ func (s *PnlService) calcAndPush(ctx context.Context, userID string, triggerPric
 		totalPnlRate = ((stockValue - totalCostBasis) / totalCostBasis) * 100
 	}
 
-	payload := PnlUpdatePayload{
+	return &PnlUpdatePayload{
 		Type:                "PNL_UPDATE",
 		UserID:              userID,
 		Deposit:             deposit,
 		Principal:           principal,
-		StockValue:          math.Round(stockValue*100) / 100,
-		RealtimeTotalEquity: math.Round(realtimeTotalEquity*100) / 100,
-		TotalPnlAmount:      math.Round(totalPnlAmount*100) / 100,
-		TotalPnlRate:        math.Round(totalPnlRate*100) / 100,
+		StockValue:          round2(stockValue),
+		RealtimeTotalEquity: round2(realtimeTotalEquity),
+		TotalPnlAmount:      round2(totalPnlAmount),
+		TotalPnlRate:        round2(totalPnlRate),
 		Holdings:            holdingDetails,
 		Ts:                  time.Now().UnixMilli(),
-	}
-
-	s.notifier.PushToUser(userID, payload)
-	return nil
+	}, nil
 }
 
 func parseInfoPrice(v interface{}) float64 {
@@ -269,4 +314,8 @@ func parseInfoPrice(v interface{}) float64 {
 	}
 	f, _ := strconv.ParseFloat(s, 64)
 	return f
+}
+
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
 }

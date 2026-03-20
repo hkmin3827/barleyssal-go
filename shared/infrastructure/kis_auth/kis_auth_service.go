@@ -1,5 +1,3 @@
-// Package kisauth manages KIS (Korea Investment Securities) authentication tokens.
-// It mirrors src/shared/infrastructure/kis-auth/kisAuthService.js.
 package kisauth
 
 import (
@@ -74,8 +72,7 @@ func (s *KisAuthService) GetAccessToken(ctx context.Context) (string, error) {
 }
 
 
-func (s *KisAuthService) FetchApprovalKey(ctx context.Context) (string, error) {
-	// Check Redis cache first
+func (s *KisAuthService) EnsureApprovalKey(ctx context.Context) (string, error) {
 	cached, err := s.rdb.Get(ctx, redisApprovalKey).Result()
 	if err == nil && cached != "" {
 		s.mu.Lock()
@@ -182,8 +179,6 @@ func (s *KisAuthService) FetchAccessToken(ctx context.Context) (string, error) {
 	return result.AccessToken, nil
 }
 
-
-
 func (s *KisAuthService) StartTokenScheduler() {
 	if s.sched != nil {
 		s.log.Warn("KIS Token Scheduler가 이미 실행 중입니다.")
@@ -227,28 +222,12 @@ func (s *KisAuthService) StopTokenScheduler() {
 func (s *KisAuthService) InitKisAuth(ctx context.Context) error {
 	s.log.Info("KIS 인증 정보 초기화 시작...")
 
-	// Access Token
-	if cached, err := s.rdb.Get(ctx, redisTokenKey).Result(); err == nil && cached != "" {
-		s.mu.Lock()
-		s.accessToken = cached
-		s.mu.Unlock()
-		s.log.Info("KIS Access Token Redis 캐시에서 복구 성공 ✅")
-	} else {
-		if _, err := s.FetchAccessToken(ctx); err != nil {
-			return fmt.Errorf("initKisAuth: access token 발급 실패: %w", err)
-		}
-	}
-
-	if cached, err := s.rdb.Get(ctx, redisApprovalKey).Result(); err == nil && cached != "" {
-		s.mu.Lock()
-		s.approvalKey = cached
-		s.mu.Unlock()
-		s.log.Info("KIS Approval Key Redis 캐시에서 복구 성공 ✅")
-	} else {
-		if _, err := s.FetchApprovalKey(ctx); err != nil {
-			return fmt.Errorf("initKisAuth: approval key 발급 실패: %w", err)
-		}
-	}
+	if _, err := s.GetAccessToken(ctx); err != nil {
+        return fmt.Errorf("initKisAuth: access token 발급 실패: %w", err)
+    }
+	 if _, err := s.EnsureApprovalKey(ctx); err != nil {
+        return fmt.Errorf("initKisAuth: approval key 발급 실패: %w", err)
+    }
 
 	s.StartTokenScheduler()
 	return nil

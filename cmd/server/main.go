@@ -10,6 +10,8 @@ import (
 	kisauth "barleyssal-go/shared/infrastructure/kis_auth"
 	wshub "barleyssal-go/shared/infrastructure/websocket"
 	"barleyssal-go/shared/price"
+	"barleyssal-go/shared/ratelimit"
+	"barleyssal-go/shared/session"
 	"barleyssal-go/shared/utils"
 	"context"
 	"encoding/json"
@@ -37,7 +39,11 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
 		Password: cfg.Redis.Password,
-		DB:       cfg.Redis.DB,
+		DB:       cfg.Redis.DB,  
+		PoolSize: 20, 
+		MinIdleConns: 5,
+  	DialTimeout: 3*time.Second,
+		PoolTimeout: 4*time.Second,
 	})
 
 	ctx := context.Background()
@@ -61,7 +67,8 @@ func main() {
 		log.Error("Kafka producer connection failed – executions will not work", zap.Error(err))
 	}
 
-	hub := wshub.NewHub(log)
+	sessionRes := session.NewResolver(rdb)
+	hub := wshub.NewHub(log, cfg, sessionRes)
 
 	pnlSvc := pnlapp.New(rdb, hub, log)
 	hub.SetPnlService(pnlSvc)
@@ -69,7 +76,7 @@ func main() {
 	matchEng := matchingapp.New(cfg, rdb, execProducer, hub, log)
 
 	kisRestClient := utils.NewKisRestClient(log)
-	chartSvc := chartapp.New(cfg, rdb, authSvc, kisRestClient, log)
+	chartSvc := chartapp.New(cfg, rdb, authSvc, kisRestClient, hub, log)
 
 	priceSvc := price.New(cfg, rdb, chartSvc, matchEng, pnlSvc, log)
 
@@ -104,13 +111,11 @@ func main() {
 		authSvc,
 		priceSvc, 
 		hub,
+		chartSvc,	
 		log,
 	)
 
 	go extClient.RunScheduler(cancelCtx)
-	if err := extClient.Start(ctx); err != nil {
-		log.Error("KIS external client failed to start", zap.Error(err))
-	}
 
 go func() {
 	log.Info("실시간 랭킹 스케쥴러 티커 활동")
@@ -155,7 +160,6 @@ go func() {
 	}
 }()
 
-	// Echo HTTP Server
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
@@ -166,11 +170,13 @@ go func() {
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins:     []string{cfg.CorsOrigin},
 		AllowCredentials: true,
+		AllowMethods: middleware.DefaultCORSConfig.AllowMethods,
+		AllowHeaders: []string{"Content-Type", "X-XSRF-TOKEN"},
 	}))
 
-	e.Use(middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(70)))
+	e.Use(middleware.RateLimiter(ratelimit.NewRedisRateLimiterStore(rdb, 70, time.Second)))
 
-	httphandler.New(chartSvc, priceSvc, rdb, hub, log).RegisterRoutes(e)
+	httphandler.New(chartSvc, priceSvc, pnlSvc, rdb, hub, log, sessionRes).RegisterRoutes(e)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -191,8 +197,6 @@ go func() {
 		}
 	}()
 
-
-
 	// Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
@@ -212,4 +216,3 @@ go func() {
 
 	log.Info("Shutdown complete")
 }
-

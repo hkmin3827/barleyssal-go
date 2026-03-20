@@ -20,7 +20,6 @@ const (
 	dlqTopic          = "service-common-dlq"
 )
 
-// OrderRequestEvent mirrors the OrderRequestEvent typedef in orderConsumer.js.
 type OrderRequestEvent struct {
 	OccurredAt int64  `json:"occurredAt"`
 	OrderID    string `json:"orderId"`
@@ -35,10 +34,8 @@ type OrderRequestEvent struct {
 	Timestamp  int64 `json:"timestamp"`
 }
 
-// OrderHandler is called for each successfully parsed order event.
 type OrderHandler func(ctx context.Context, event OrderRequestEvent) error
 
-// DLQMessage is the payload written to the dead-letter queue.
 type DLQMessage struct {
 	OriginalTopic string `json:"originalTopic"`
 	Payload       string `json:"payload"`
@@ -47,7 +44,6 @@ type DLQMessage struct {
 	Timestamp     int64 `json:"timestamp"`
 }
 
-// OrderConsumer wraps a kafka-go Reader for the order.request topic.
 type OrderConsumer struct {
 	reader    *kfkgo.Reader
 	dlqWriter *kfkgo.Writer
@@ -56,7 +52,6 @@ type OrderConsumer struct {
 	stopCh    chan struct{}
 }
 
-// NewOrderConsumer creates a new Kafka consumer for the order-request topic.
 func NewOrderConsumer(cfg *config.Config, handler OrderHandler, log *zap.Logger) *OrderConsumer {
 	reader := kfkgo.NewReader(kfkgo.ReaderConfig{
 		Brokers:           cfg.Kafka.Brokers,
@@ -86,7 +81,6 @@ func NewOrderConsumer(cfg *config.Config, handler OrderHandler, log *zap.Logger)
 	}
 }
 
-// Start begins consuming messages in a background goroutine.
 func (c *OrderConsumer) Start(ctx context.Context) {
 	go c.consume(ctx)
 	c.log.Info("Order consumer started", zap.String("topic", orderRequestTopic))
@@ -127,7 +121,6 @@ func (c *OrderConsumer) consume(ctx context.Context) {
 			if isTransientError(err) {
 				c.log.Error("Transient error. Will retry on next fetch.",
 					zap.Error(err), zap.String("orderId", event.OrderID))
-				// No commit — message will be re-delivered
 				continue
 			}
 			c.log.Error("Permanent error. Sending to DLQ.",
@@ -159,7 +152,6 @@ func (c *OrderConsumer) sendToDLQ(ctx context.Context, originalTopic, payload, e
 	}
 }
 
-// Stop signals the consumer goroutine and closes the reader.
 func (c *OrderConsumer) Stop() error {
 	close(c.stopCh)
 	if err := c.reader.Close(); err != nil {

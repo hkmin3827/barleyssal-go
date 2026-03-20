@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,8 +18,7 @@ const (
 )
 
 type KisRestClient struct {
-	mu         sync.Mutex
-	lastCallAt time.Time
+	tokenCh    chan struct{}
 	httpClient *http.Client
 	log        *zap.Logger
 }
@@ -28,28 +26,37 @@ type KisRestClient struct {
 
 
 func NewKisRestClient(log *zap.Logger) *KisRestClient {
-	return &KisRestClient{
+	c := &KisRestClient{
+		tokenCh:    make(chan struct{}, 1),
 		httpClient: &http.Client{Timeout: kisTimeoutMs},
 		log:        log,
 	}
-}
 
-func (c *KisRestClient) enforceRateLimit() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.tokenCh <- struct{}{}
 
-	elapsed := time.Since(c.lastCallAt)
-	if elapsed < kisRateLimitDelay {
-		time.Sleep(kisRateLimitDelay - elapsed)
-	}
-	c.lastCallAt = time.Now()
+	go func() {
+		ticker := time.NewTicker(kisRateLimitDelay)
+		for range ticker.C {
+			select {
+			case c.tokenCh <- struct{}{}: 
+			default: 
+			}
+		}
+	}()
+
+	return c
 }
 
 func (c *KisRestClient) FetchKisAPI(ctx context.Context, url string, headers map[string]string) (map[string]interface{}, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= kisMaxRetries; attempt++ {
-		c.enforceRateLimit()
+
+		select {
+		case <-c.tokenCh:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("KIS rate limit wait cancelled: %w", ctx.Err())
+		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, kisTimeoutMs)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)

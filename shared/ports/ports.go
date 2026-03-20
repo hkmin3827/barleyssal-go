@@ -5,11 +5,20 @@ import (
 	"time"
 )
 
-
+type BarEvent struct {
+	T string  `json:"t"`
+	O float64 `json:"o"`
+	H float64 `json:"h"`
+	L float64 `json:"l"`
+	C float64 `json:"c"`
+	V float64 `json:"v"`
+}
+ 
 type UserNotifier interface {
 	PushToUser(userID string, data interface{})
 	BroadcastPriceUpdate(stockCode string, tickData map[string]interface{})
 	BroadcastToAll(payload []byte)
+	BroadcastBarComplete(stockCode string, bar BarEvent)
 	NotifyExecution(data interface{})
 	GetConnectedCount() int
 }
@@ -36,6 +45,6 @@ type PriceEventHandler interface {
 		acmlVol   int64,
 		eventTime time.Time,
 		mkopCode  string,
-	) error
+	) (BarEvent, error)
 	UpdateBuyVolume(ctx context.Context, stockCode string, shnuCntgSmtn float64)
 }

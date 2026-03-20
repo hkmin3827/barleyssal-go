@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	chartapp "barleyssal-go/domains/chart/application"
 	kisauth "barleyssal-go/shared/infrastructure/kis_auth"
 	"barleyssal-go/shared/ports"
 
@@ -22,12 +24,16 @@ type ExternalMarketClient struct {
 	authSvc   *kisauth.KisAuthService
 	priceHook ports.PriceEventHandler
 	hub       *Hub
+	chartSvc  *chartapp.ChartService 
 	log       *zap.Logger
 
 	mu       sync.Mutex
+	writeMu sync.Mutex
 	conn     *websocket.Conn
 	stopping bool
 	stopCh   chan struct{}
+	flushCancel context.CancelFunc 
+
 }
 
 func NewExternalMarketClient(
@@ -36,6 +42,7 @@ func NewExternalMarketClient(
 	authSvc *kisauth.KisAuthService,
 	priceHook ports.PriceEventHandler,
 	hub *Hub,
+	chartSvc *chartapp.ChartService,
 	log *zap.Logger,
 ) *ExternalMarketClient {
 	return &ExternalMarketClient{
@@ -44,6 +51,7 @@ func NewExternalMarketClient(
 		authSvc:   authSvc,
 		priceHook: priceHook,
 		hub:       hub,
+		chartSvc:  chartSvc,
 		log:       log,
 		stopCh:    make(chan struct{}),
 	}
@@ -59,7 +67,7 @@ func (c *ExternalMarketClient) Start(ctx context.Context) error {
 	c.stopCh = make(chan struct{})
 	c.mu.Unlock()
 
-	if _, err := c.authSvc.FetchApprovalKey(ctx); err != nil {
+	if _, err := c.authSvc.EnsureApprovalKey(ctx); err != nil {
 		return err
 	}
 	go c.connect(ctx)
@@ -71,38 +79,68 @@ func (c *ExternalMarketClient) Stop() {
 	c.stopping = true
 	conn := c.conn
 	c.conn = nil
+	flushCancel := c.flushCancel
+	c.flushCancel = nil
 	c.mu.Unlock()
 
 	close(c.stopCh)
 
+	if flushCancel != nil {
+		flushCancel()
+	}
+
 	if conn != nil {
-		c.unsubscribeAll(conn)
-		time.Sleep(time.Duration(len(c.watchList)*50+1000) * time.Millisecond)
+		c.sendSubscriptions(conn, "2")  
 		conn.Close()
 		c.log.Info("KIS 웹소켓 구독 취소 및 연결 종료 완료")
 	}
+
 }
 
 func (c *ExternalMarketClient) connect(ctx context.Context) {
 	c.log.Info("KIS WebSocket 연결 중...", zap.String("url", c.wsURL))
-	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	dialer := websocket.Dialer{
+        HandshakeTimeout: 15 * time.Second,
+        NetDial: func(network, addr string) (net.Conn, error) {
+            return (&net.Dialer{
+                Timeout:   10 * time.Second,
+                KeepAlive: 15 * time.Second,
+            }).Dial(network, addr)
+        },
+    }
+		
 	conn, _, err := dialer.DialContext(ctx, c.wsURL, nil)
 	if err != nil {
-		c.log.Error("KIS WS 연결 실패", zap.Error(err))
-		c.scheduleReconnect(ctx)
-		return
+			c.log.Error("KIS WS 연결 실패", zap.Error(err))
+			c.scheduleReconnect(ctx)
+			return
 	}
 
 	c.mu.Lock()
 	c.conn = conn
+	connCtx, connCancel := context.WithCancel(ctx)
 	c.mu.Unlock()
 
+	defer connCancel()
+	defer conn.Close()
+
 	c.log.Info("KIS WS 연결 성공")
-	c.subscribeAll(conn)
+	go c.sendSubscriptions(conn, "1")  
+
+	if c.chartSvc != nil {
+		c.mu.Lock()
+		if c.flushCancel != nil {
+			c.flushCancel()
+		}
+		flushCtx, flushCancel := context.WithCancel(ctx)
+		c.flushCancel = flushCancel
+		c.mu.Unlock()
+		c.chartSvc.StartFlusher(flushCtx)
+	}
 
 	
-	const pongWait = 60 * time.Second
-	const pingPeriod = (pongWait * 9) / 10 
+	const pongWait = 30 * time.Second
+	const pingPeriod = 20 * time.Second  
 	
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 
@@ -111,24 +149,23 @@ func (c *ExternalMarketClient) connect(ctx context.Context) {
         return nil 
     })
 
-	go func() {
+	go func(ctx context.Context, targetConn *websocket.Conn) {
         ticker := time.NewTicker(pingPeriod)
         defer ticker.Stop()
         for {
             select {
             case <-ticker.C:
-                c.mu.Lock()
-                if c.conn != nil {
-                    if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-                        c.log.Warn("Standard Ping failed", zap.Error(err))
-                    }
-                }
-                c.mu.Unlock()
+												if err := c.safeWrite(targetConn, websocket.PingMessage, nil); err != nil {
+													c.log.Warn("Standard Ping failed", zap.Error(err))
+													return
+						}
+						case <-ctx.Done(): // 연결이 끊기거나 cancel되면 종료
+                return
             case <-c.stopCh:
                 return
             }
         }
-    }()
+    }(connCtx, conn)
 
 	for {
 		_, raw, err := conn.ReadMessage()
@@ -157,7 +194,7 @@ func (c *ExternalMarketClient) scheduleReconnect(ctx context.Context) {
 		return
 	}
 	time.Sleep(5 * time.Second)
-	if _, err := c.authSvc.FetchApprovalKey(ctx); err != nil {
+	if _, err := c.authSvc.EnsureApprovalKey(ctx); err != nil {
 		c.log.Error("Approval Key 재발급 실패", zap.Error(err))
 		c.scheduleReconnect(ctx)
 		return
@@ -172,15 +209,14 @@ func (c *ExternalMarketClient) RunScheduler(ctx context.Context) {
 		loc = time.Local
 	}
 
-	ticker := time.NewTicker(1 * time.Minute) // 1분마다 시간 체크
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	// 시작하자마자 현재 시간 체크해서 켤지 말지 결정
 	c.checkAndToggle(ctx, loc)
 
 	for {
 		select {
-		case <-ctx.Done(): // 메인 서버 종료 시 스케줄러도 종료
+		case <-ctx.Done(): 
 			return
 		case <-ticker.C:
 			c.checkAndToggle(ctx, loc)
@@ -191,14 +227,11 @@ func (c *ExternalMarketClient) RunScheduler(ctx context.Context) {
 func (c *ExternalMarketClient) checkAndToggle(ctx context.Context, loc *time.Location) {
 	now := time.Now().In(loc)
 	
-	// 평일 (월~금) 체크
 	isWeekday := now.Weekday() >= time.Monday && now.Weekday() <= time.Friday
 	
-	// 시간 코드로 변환 (예: 08:30 -> 830, 16:00 -> 1600)
 	hour, min, _ := now.Clock()
 	timeCode := hour*100 + min
 
-	// 동작 시간: 평일 08:30 ~ 16:00 (시뮬레이션 환경에 맞춰 조정 가능)
 	isActiveTime := isWeekday && timeCode >= 630 && timeCode <= 1800
 
 	c.mu.Lock()
@@ -207,7 +240,6 @@ func (c *ExternalMarketClient) checkAndToggle(ctx context.Context, loc *time.Loc
 
 	if isActiveTime && !isRunning {
 		c.log.Info("📈 장 운영 시간입니다. KIS WS 연결을 시작합니다.")
-		// 기존 Start 내부에서 stopCh를 다시 make 해주는 로직이 필요합니다 (아래 STEP 2 참고)
 		if err := c.Start(ctx); err != nil {
 			c.log.Error("스케줄러: KIS WS 시작 실패", zap.Error(err))
 		}
@@ -217,29 +249,18 @@ func (c *ExternalMarketClient) checkAndToggle(ctx context.Context, loc *time.Loc
 	}
 }
 
-func (c *ExternalMarketClient) subscribeAll(conn *websocket.Conn) {
-	key := c.authSvc.GetApprovalKey()
-	if key == "" {
-		c.log.Error("Approval Key 없음 - KIS 구독 중단")
-		return
-	}
-	for i, code := range c.watchList {
-		time.Sleep(time.Duration(i) * 50 * time.Millisecond)
-		_ = c.safeWrite(conn, websocket.TextMessage, c.buildMsg(key, code, "1"))
-	}
-	c.log.Info("KIS 구독 요청 완료", zap.Int("count", len(c.watchList)))
+func (c *ExternalMarketClient) sendSubscriptions(conn *websocket.Conn, trType string) {
+    key := c.authSvc.GetApprovalKey()
+    if key == "" {
+        c.log.Error("Approval Key 없음 - KIS 구독 중단")
+        return
+    }
+    for _, code := range c.watchList {
+        time.Sleep(50 * time.Millisecond)
+        _ = c.safeWrite(conn, websocket.TextMessage, c.buildMsg(key, code, trType))
+    }
 }
 
-func (c *ExternalMarketClient) unsubscribeAll(conn *websocket.Conn) {
-	key := c.authSvc.GetApprovalKey()
-	if key == "" {
-		return
-	}
-	for i, code := range c.watchList {
-		time.Sleep(time.Duration(i) * 50 * time.Millisecond)
-		_ = c.safeWrite(conn, websocket.TextMessage, c.buildMsg(key, code, "2"))
-	}
-}
 
 func (c *ExternalMarketClient) buildMsg(approvalKey, code, trType string) []byte {
 	b, _ := json.Marshal(map[string]interface{}{
@@ -261,7 +282,7 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 		if err := json.Unmarshal([]byte(raw), &j); err == nil {
 			if hdr, ok := j["header"].(map[string]interface{}); ok {
 				if hdr["tr_id"] == "PINGPONG" {
-				_ = c.safeWrite(conn, websocket.TextMessage, []byte(raw))
+					_ = c.safeWrite(conn, websocket.TextMessage, []byte(raw))
 				}
 			}
 		}
@@ -309,7 +330,6 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 		mkopCode = fields[34]
 	}
 
-	// KIS 시간 문자열 → UTC 변환
 	kisTimeStr := fields[1]
 	loc, _ := time.LoadLocation("Asia/Seoul")
 	nowKST := time.Now().In(loc)
@@ -319,11 +339,13 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 
 	prdyVrssSignInt := parseInt64(prdyVrssSign)
 
-	if err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, changeRate, int64(cntgVol), prdyVrssSignInt ,prdyVrss, stckOprc, stckHgpr, stckLwpr, acmlVol, utcTime, mkopCode); err != nil {
+	
+	liveBar, err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, changeRate, int64(cntgVol), prdyVrssSignInt ,prdyVrss, stckOprc, stckHgpr, stckLwpr, acmlVol, utcTime, mkopCode)
+
+	if err != nil {
 		c.log.Warn("priceHook.OnPriceUpdate failed", zap.String("stockCode", stockCode), zap.Error(err))
 	}
 
-	// 금일 매수 거래량 갱신
 	if shnuCntgSmtn > 0 {
 		c.priceHook.UpdateBuyVolume(ctx, stockCode, shnuCntgSmtn)
 	}
@@ -349,6 +371,10 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 		"mkopCode":        mkopCode,
 		"shnuCntgSmtn":    shnuCntgSmtn,
 		"ts":              utcTime.UnixMilli(),
+		"ohlcv": map[string]interface{}{
+        "t": liveBar.T, "o": liveBar.O, "h": liveBar.H,
+        "l": liveBar.L, "c": liveBar.C, "v": liveBar.V,
+		},
 	}
 	c.hub.BroadcastPriceUpdate(stockCode, tickData)
 }
@@ -366,7 +392,7 @@ func parseInt64(v interface{}) int64 {
 }
 
 func (c *ExternalMarketClient) safeWrite(conn *websocket.Conn, messageType int, data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return conn.WriteMessage(messageType, data)
 }

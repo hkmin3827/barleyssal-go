@@ -1,4 +1,3 @@
-// Package chartapplication handles real-time OHLCV bar building and chart data retrieval.
 package chartapplication
 
 import (
@@ -12,6 +11,7 @@ import (
 
 	"barleyssal-go/config"
 	kisauth "barleyssal-go/shared/infrastructure/kis_auth"
+	"barleyssal-go/shared/ports"
 	"barleyssal-go/shared/utils"
 
 	"github.com/redis/go-redis/v9"
@@ -61,6 +61,7 @@ type ChartService struct {
 	authSvc    *kisauth.KisAuthService
 	restClient *utils.KisRestClient
 	log        *zap.Logger
+	notifier ports.UserNotifier
 
 	mu     sync.Mutex
 	buffer map[string]*barBuf 
@@ -71,6 +72,7 @@ func New(
 	rdb *redis.Client,
 	authSvc *kisauth.KisAuthService,
 	restClient *utils.KisRestClient,
+	notifier ports.UserNotifier,
 	log *zap.Logger,
 ) *ChartService {
 	return &ChartService{
@@ -78,25 +80,23 @@ func New(
 		rdb:        rdb,
 		authSvc:    authSvc,
 		restClient: restClient,
+		notifier: notifier,
 		log:        log,
 		buffer:     make(map[string]*barBuf),
 	}
 }
 
-func (s *ChartService) UpdateOhlcvBuffer(ctx context.Context, code string, price, cntgVol float64, pipe redis.Pipeliner, eventTime time.Time) {
-	minute := utils.BuildMinuteKey(eventTime) // YYYYMMDDHHmm
+func (s *ChartService) UpdateOhlcvBuffer(ctx context.Context, code string, price, cntgVol float64, pipe redis.Pipeliner, eventTime time.Time) ports.BarEvent {
+	minute := utils.BuildMinuteKey(eventTime)
 
 	snapshot := s.applyTick(ctx, code, price, cntgVol, minute, pipe)
 
-	payload, _ := json.Marshal(OhlcvBarJSON{
-		T: snapshot.minute,
-		O: snapshot.open,
-		H: snapshot.high,
-		L: snapshot.low,
-		C: snapshot.close,
-		V: snapshot.volume,
-	})
+	bar := ports.BarEvent{T: snapshot.minute, O: snapshot.open, H: snapshot.high, L: snapshot.low, C: snapshot.close, V: snapshot.volume}
+  payload, _ := json.Marshal(bar)
+
 	pipe.Set(ctx, "market:ohlcv:live:"+code, string(payload), 2*time.Minute)
+
+	return bar
 }
 
 func (s *ChartService) applyTick(ctx context.Context, code string, price, cntgVol float64, minute string, pipe redis.Pipeliner) barBuf {
@@ -133,6 +133,60 @@ func (s *ChartService) applyTick(ctx context.Context, code string, price, cntgVo
 	return *bar 
 }
 
+func (s *ChartService) StartFlusher(ctx context.Context) {
+	go func() {
+		now := time.Now().UTC()
+		nextMinute := now.Truncate(time.Minute).Add(time.Minute)
+		select {
+		case <-time.After(time.Until(nextMinute)):
+		case <-ctx.Done():
+			return
+		}
+
+		s.flushExpiredBars(ctx)
+
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.flushExpiredBars(ctx)
+			}
+		}
+	}()
+	s.log.Info("OHLCV 주기적 플러셔 시작 (KIS WS 연결 연동)")
+}
+
+func (s *ChartService) flushExpiredBars(ctx context.Context) {
+	currentMinute := utils.BuildMinuteKey(time.Now().UTC())
+
+	s.mu.Lock()
+	toFlush := make(map[string]*barBuf)
+	for code, bar := range s.buffer {
+		if bar.minute < currentMinute {
+			toFlush[code] = bar
+			delete(s.buffer, code)
+		}
+	}
+	s.mu.Unlock()
+
+	if len(toFlush) == 0 {
+		return
+	}
+
+	pipe := s.rdb.Pipeline()
+	for code, bar := range toFlush {
+		s.pushCompletedBar(ctx, code, bar, pipe)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		s.log.Warn("flushExpiredBars pipeline 실패", zap.Error(err))
+		return
+	}
+	s.log.Info("OHLCV 주기 플러시 완료", zap.Int("codes", len(toFlush)), zap.String("minute", currentMinute))
+}
+
 func (s *ChartService) pushCompletedBar(ctx context.Context, code string, bar *barBuf, pipe redis.Pipeliner) {
 	payload, err := json.Marshal(OhlcvBarJSON{
 		T: bar.minute,
@@ -149,8 +203,15 @@ func (s *ChartService) pushCompletedBar(ctx context.Context, code string, bar *b
 
 	key := "market:ohlcv:1m:" + code
 	pipe.LPush(ctx, key, string(payload))
-	pipe.LTrim(ctx, key, 0, 999) 
+	pipe.LTrim(ctx, key, 0, 2999) 
 	pipe.Expire(ctx, key, time.Duration(s.cfg.Cache.OhlcvTTL)*time.Second)
+
+	 if s.notifier != nil {
+        s.notifier.BroadcastBarComplete(code, ports.BarEvent{
+            T: bar.minute, O: bar.open, H: bar.high,
+            L: bar.low,  C: bar.close, V: bar.volume,
+        })
+    }
 }
 
 var minuteRegex = regexp.MustCompile(`^(\d+)m$`)
@@ -189,7 +250,7 @@ func (s *ChartService) GetOhlcv(ctx context.Context, code, timeframe string, lim
 		}
 	}
 
-	reverseBarJSON(bars)
+	reverseSlice(bars)
 
 	if chunk > 1 {
 		bars = aggregateBars(bars, chunk)
@@ -251,7 +312,6 @@ func toEntries(bars []OhlcvBarJSON) []OhlcvEntry {
 	return entries
 }
 
-// barTimeToMs: "YYYYMMDDHHmm" → Unix milliseconds (UTC)
 func barTimeToMs(t string) int64 {
 	if len(t) < 12 {
 		return 0
@@ -324,23 +384,16 @@ func (s *ChartService) GetPeriodChartData(ctx context.Context, stockCode, period
 		})
 	}
 
-	reverseChartData(list) 
+	reverseSlice(list) 
 	return list, nil
 }
 
 
 
-
-func reverseBarJSON(s []OhlcvBarJSON) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
-}
-
-func reverseChartData(s []ChartData) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
+func reverseSlice[T any](s []T) {
+    for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+        s[i], s[j] = s[j], s[i]
+    }
 }
 
 func strVal(m map[string]interface{}, key string) string {

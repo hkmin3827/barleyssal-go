@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -49,7 +50,10 @@ type CacheConfig struct {
 
 
 func Load() *Config {
-	_ = godotenv.Load()
+	err := godotenv.Load()
+	if err != nil {
+					fmt.Println("Info: .env file not found, using system environment variables")
+			}
 
 	return &Config{
 		Port: parseInt(os.Getenv("PORT"), 4000),
@@ -76,12 +80,13 @@ func Load() *Config {
 		},
 
 		Cache: CacheConfig{
-			PriceTTL: parseInt(os.Getenv("PRICE_CACHE_TTL"), 10),
+			PriceTTL: parseInt(os.Getenv("PRICE_CACHE_TTL"), 86400),
 			OhlcvTTL: parseInt(os.Getenv("OHLCV_CACHE_TTL"), 604800),
 			InfoTTL: parseInt(os.Getenv("INFO_CACHE_TTL"), 604800),
 		},
 
-		CorsOrigin: envStr("CORS_ORIGIN", "*"),
+		CorsOrigin: envStr("CORS_ORIGIN", "http://localhost:5173"),
+
 	}
 }
 

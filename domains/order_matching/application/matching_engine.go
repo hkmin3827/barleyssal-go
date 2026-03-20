@@ -14,6 +14,8 @@ import (
 )
 
 func priceKey(code string) string       { return "market:price:" + code }
+func infoKey(code string) string { return "market:info:" + code }
+
 func pendingBuyKey(code string) string  { return "orders:pending:" + code + ":BUY" }
 func pendingSellKey(code string) string { return "orders:pending:" + code + ":SELL" }
 func orderMetaKey(id string) string     { return "order:meta:" + id }
@@ -101,13 +103,32 @@ func (e *MatchingEngine) OnOrderReceived(ctx context.Context, event OrderEvent) 
 
 func (e *MatchingEngine) CheckLimitOrders(ctx context.Context, stockCode, tickPriceStr string) error {
 	currentPriceStr := tickPriceStr
+
 	if currentPriceStr == "" {
-		val, err := e.rdb.Get(ctx, priceKey(stockCode)).Result()
+		pipe := e.rdb.Pipeline()
+		priceCmd := pipe.Get(ctx, priceKey(stockCode))
+		infoCmd := pipe.HGet(ctx, infoKey(stockCode), "mKopCode")
+
+		_, _ = pipe.Exec(ctx)
+
+		mkop, _ := infoCmd.Result()
+		if mkop != "" && mkop[0] != '2' {
+				e.log.Debug("Market closed, skipping match", zap.String("code", stockCode), zap.String("mkop", mkop))
+				return nil 
+		}
+
+		val, err := priceCmd.Result()
 		if err != nil || val == "" {
-			return nil
+				return nil
 		}
 		currentPriceStr = val
+	} else {
+			mkop, _ := e.rdb.HGet(ctx, infoKey(stockCode), "mKopCode").Result()
+			if mkop != "" && mkop[0] != '2' {
+					return nil
+			}
 	}
+
 	buyErr := e.matchOrders(ctx, stockCode, currentPriceStr, "BUY")
 	sellErr := e.matchOrders(ctx, stockCode, currentPriceStr, "SELL")
 	if buyErr != nil {
@@ -118,10 +139,18 @@ func (e *MatchingEngine) CheckLimitOrders(ctx context.Context, stockCode, tickPr
 
 
 func (e *MatchingEngine) executeMarketOrder(ctx context.Context, event OrderEvent) error {
-	priceStr, err := e.rdb.Get(ctx, priceKey(event.StockCode)).Result()
+	pipe := e.rdb.Pipeline()
+	priceCmd := pipe.Get(ctx, priceKey(event.StockCode))
+	infoCmd := pipe.HGet(ctx, infoKey(event.StockCode), "mKopCode")
 
-	if err != nil || priceStr == "" {
-		e.log.Warn("Market order CANCELLED: No current price in Redis.", zap.String("orderId", event.OrderID))
+	_, _ = pipe.Exec(ctx) 
+
+	mkop, _ := infoCmd.Result()
+	if mkop != "" && mkop[0] != '2' {
+		e.log.Warn("Market order REJECTED: Market is closed.", 
+			zap.String("orderId", event.OrderID), 
+			zap.String("mkopCode", mkop))
+		
 		return e.fireExecution(ctx, fireParams{
 			OrderID:       event.OrderID,
 			UserID:        event.UserID,
@@ -132,6 +161,23 @@ func (e *MatchingEngine) executeMarketOrder(ctx context.Context, event OrderEven
 			OrderType: 		event.OrderType,
 			Quantity:      "0",
 			ExecutedPrice: 	0,
+			ExecutionStatus: "CANCELLED",
+		})
+	}
+
+	priceStr, err := priceCmd.Result()
+	if err != nil || priceStr == "" {
+		e.log.Warn("Market order CANCELLED: No current price in Redis.", zap.String("orderId", event.OrderID))
+		return e.fireExecution(ctx, fireParams{
+			OrderID:         event.OrderID,
+			UserID:          event.UserID,
+			UserName:        event.UserName,
+			AccountID:       event.AccountID,
+			StockCode:       event.StockCode,
+			OrderSide:       event.OrderSide,
+			OrderType:       event.OrderType,
+			Quantity:        "0",
+			ExecutedPrice:   0,
 			ExecutionStatus: "CANCELLED",
 		})
 	}
@@ -153,40 +199,49 @@ func (e *MatchingEngine) executeMarketOrder(ctx context.Context, event OrderEven
 }
 
 
+const fetchAndRemScript = `
+	local ids = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], ARGV[2])
+	if #ids > 0 then
+			for _, id in ipairs(ids) do
+					redis.call('ZREM', KEYS[1], id)
+			end
+	end
+	return ids
+`
 func (e *MatchingEngine) matchOrders(ctx context.Context, stockCode, currentPriceStr, orderSide string) error {
 	var zKey string
+	var min, max string
+
 	if orderSide == "BUY" {
 		zKey = pendingBuyKey(stockCode)
+		min = currentPriceStr
+		max = "+inf"
 	} else {
 		zKey = pendingSellKey(stockCode)
+		min = "-inf"
+		max = currentPriceStr
 	}
 
-	var rangeBy *redis.ZRangeBy
-
-if orderSide == "BUY" {
-    rangeBy = &redis.ZRangeBy{Min: currentPriceStr, Max: "+inf"}
-} else {
-    rangeBy = &redis.ZRangeBy{Min: "-inf", Max: currentPriceStr}
-}
+	result, err := e.rdb.Eval(ctx, fetchAndRemScript, []string{zKey}, min, max).Result()
+		if err != nil {
+			return fmt.Errorf("Lua script execution failed for %s: %w", zKey, err)
+		}
 	
-	orderIDs, err := e.rdb.ZRangeByScore(ctx, zKey, rangeBy).Result()
-
-
-	if err != nil {
-		return fmt.Errorf("ZRangeByScore failed for %s: %w", zKey, err)
-	}
-	if len(orderIDs) == 0 {
+	orderIDs, ok := result.([]interface{})
+	if !ok || len(orderIDs) == 0 {
 		return nil
 	}
 
-	for _, orderID := range orderIDs {
+	e.log.Info("Matching orders found", zap.Int("count", len(orderIDs)), zap.String("side", orderSide))
+
+	for _, rawID := range orderIDs {
+		orderID := rawID.(string)
 		rawMeta, err := e.rdb.HGetAll(ctx, orderMetaKey(orderID)).Result()
 		if err != nil || len(rawMeta) == 0 || rawMeta["orderId"] == "" {
-			_ = e.rdb.ZRem(ctx, zKey, orderID).Err()
+			e.log.Warn("Order metadata missing, skipping", zap.String("orderId", orderID))
 			continue
 		}
-
-		meta := OrderMeta{
+				meta := OrderMeta{
 			OrderID:   rawMeta["orderId"],
 			UserID:    rawMeta["userId"],
 			UserName:  rawMeta["userName"],
@@ -196,7 +251,7 @@ if orderSide == "BUY" {
 			OrderType: rawMeta["orderType"],
 			Quantity:  rawMeta["quantity"],
 		}
-
+		
 		execPrice, _ := strconv.ParseFloat(currentPriceStr, 64)
 
 		if err := e.fireExecution(ctx, fireParams{
@@ -217,7 +272,6 @@ if orderSide == "BUY" {
 				zap.Error(err))
 			continue
 		}
-		_ = e.rdb.ZRem(ctx, zKey, orderID).Err()
 	}
 	return nil
 }

@@ -11,13 +11,16 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"barleyssal-go/config"
 	"barleyssal-go/shared/ports"
+	"barleyssal-go/shared/session"
 )
 
 
 type clientMeta struct {
 	mu                sync.Mutex
 	userID            string
+	verifiedUserID    string 
 	subscribedSymbols map[string]struct{}
 }
 
@@ -39,24 +42,28 @@ type Hub struct {
 	log      *zap.Logger
 	upgrader websocket.Upgrader
 	pnlSvc   ports.PnlSubscriptionService 
+	sessionRes *session.Resolver
 
 	mu           sync.RWMutex
 	userClients  map[string]map[*client]struct{}
 	priceClients map[string]map[*client]struct{}
 	allClients   map[*client]struct{}
 
-	connCount int64 // atomic
+	connCount int64
 }
 
 
 
-func NewHub(log *zap.Logger) *Hub {
+func NewHub(log *zap.Logger, 	cfg *config.Config, sessionRes *session.Resolver) *Hub {
 	return &Hub{
 		log: log,
+		sessionRes: sessionRes,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 4096,
-			CheckOrigin:     func(r *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				return r.Header.Get("Origin") == cfg.CorsOrigin
+		},
 		},
 		userClients:  make(map[string]map[*client]struct{}),
 		priceClients: make(map[string]map[*client]struct{}),
@@ -69,6 +76,19 @@ func (h *Hub) SetPnlService(svc ports.PnlSubscriptionService) {
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	const maxConns = 5000
+	if atomic.LoadInt64(&h.connCount) >= maxConns {
+		http.Error(w, `{"error":"too many connections"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	var verifiedUserID string
+	if cookie, err := r.Cookie("SESSION"); err == nil {
+		if uid, err := h.sessionRes.UserIDFromCookie(r.Context(), cookie.Value); err == nil {
+			verifiedUserID = uid
+		}
+	}
+
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.log.Warn("WebSocket upgrade failed", zap.Error(err))
@@ -78,7 +98,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c := &client{
 		conn: conn,
 		send: make(chan []byte, 256),
-		meta: &clientMeta{subscribedSymbols: make(map[string]struct{})},
+		meta: &clientMeta{
+			subscribedSymbols: make(map[string]struct{}),
+		verifiedUserID:    verifiedUserID,
+		},
 		hub:  h,
 		log:  h.log,
 	}
@@ -157,14 +180,25 @@ func (c *client) sendJSON(v interface{}) {
 	if err != nil {
 		return
 	}
-	select {
-	case c.send <- data:
-	default:
-		c.log.Warn("WS send buffer full, dropping message")
-	}
+	safeSend(c.send, data, c.log)
 }
 
-
+func safeSend(ch chan []byte, data []byte, log *zap.Logger) (sent bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			sent = false
+		}
+	}()
+	select {
+	case ch <- data:
+		return true
+	default:
+		if log != nil {
+			log.Warn("WS send buffer full, dropping message")
+		}
+		return false
+	}
+}
 
 func (h *Hub) handleMessage(c *client, raw []byte) {
 	var msg incomingMsg
@@ -177,30 +211,28 @@ func (h *Hub) handleMessage(c *client, raw []byte) {
 		h.handleSubscribePrice(c, msg.Symbols)
 
 	case "IDENTIFY_USER":
-		// userClients 등록만 — PnlService 구독 없음 (알림 수신 전용)
-		var userID string
-		switch v := msg.UserID.(type) {
-		case string:
-			userID = v
-		case float64:
-			userID = floatToString(v)
+		c.meta.mu.Lock()
+		uid := c.meta.verifiedUserID
+		c.meta.mu.Unlock()
+ 
+		if uid == "" {
+			c.sendJSON(map[string]interface{}{"type": "AUTH_REQUIRED", "ts": nowMS()})
+			return
 		}
-		if userID != "" {
-			h.handleIdentifyUser(c, userID)
-		}
+		h.handleIdentifyUser(c, uid)
 
 	case "SUBSCRIBE_ACCOUNT":
 		// userClients 등록 + PnlService 구독 (AccountPage 전용)
-		var userID string
-		switch v := msg.UserID.(type) {
-		case string:
-			userID = v
-		case float64:
-			userID = floatToString(v)
+		c.meta.mu.Lock()
+		uid := c.meta.verifiedUserID
+		c.meta.mu.Unlock()
+ 
+		if uid == "" {
+			c.sendJSON(map[string]interface{}{"type": "AUTH_REQUIRED", "ts": nowMS()})
+			return
 		}
-		if userID != "" {
-			h.handleSubscribeAccount(c, userID)
-		}
+		h.handleSubscribeAccount(c, uid)
+
 
 	case "UNSUBSCRIBE":
 		h.disconnect(c)
@@ -337,8 +369,6 @@ func (h *Hub) disconnect(c *client) {
 	close(c.send)
 }
 
-
-
 func (h *Hub) BroadcastPriceUpdate(stockCode string, tickData map[string]interface{}) {
 	payload, _ := json.Marshal(tickData)
 
@@ -347,11 +377,23 @@ func (h *Hub) BroadcastPriceUpdate(stockCode string, tickData map[string]interfa
 	h.mu.RUnlock()
 
 	for c := range clients {
-		select {
-		case c.send <- payload:
-		default:
-		}
+		safeSend(c.send, payload, nil)
 	}
+}
+
+func (h *Hub) BroadcastBarComplete(stockCode string, bar ports.BarEvent) {
+    payload, _ := json.Marshal(map[string]interface{}{
+        "type":      "BAR_COMPLETE",
+        "stockCode": stockCode,
+        "bar":       bar,
+        "ts":        time.Now().UnixMilli(),
+    })
+    h.mu.RLock()
+    clients := copyClientSet(h.priceClients[stockCode])
+    h.mu.RUnlock()
+    for c := range clients {
+        safeSend(c.send, payload, nil)
+    }
 }
 
 func (h *Hub) BroadcastToAll(payload []byte) {
@@ -360,10 +402,7 @@ func (h *Hub) BroadcastToAll(payload []byte) {
 	h.mu.RUnlock()
 
 	for c := range clients {
-		select {
-		case c.send <- payload:
-		default:
-		}
+		safeSend(c.send, payload, nil)
 	}
 }
 
@@ -375,17 +414,12 @@ func (h *Hub) PushToUser(userID string, data interface{}) {
 	if len(clients) == 0 {
 		return
 	}
-
 	payload, err := json.Marshal(data)
 	if err != nil {
 		return
 	}
-
 	for c := range clients {
-		select {
-		case c.send <- payload:
-		default:
-		}
+		safeSend(c.send, payload, nil)
 	}
 }
 
@@ -411,9 +445,6 @@ func (h *Hub) NotifyExecution(data interface{}) {
 func (h *Hub) GetConnectedCount() int {
 	return int(atomic.LoadInt64(&h.connCount))
 }
-
-
-
 
 func copyClientSet(s map[*client]struct{}) map[*client]struct{} {
 	cp := make(map[*client]struct{}, len(s))
