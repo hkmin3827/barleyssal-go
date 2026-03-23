@@ -23,9 +23,9 @@ func priceKey(code string) string  { return "market:price:" + code }
 func infoKey(code string) string   { return "market:info:" + code }
 
 const (
-	zsetChangeRate = "market:ranking:todayChangeRate" // score: 등락률(%)
-	zsetBuyVolume  = "market:ranking:todayBuyVolume"  // score: 금일 매수 누적 체결량
-	zsetAcmlVolume     = "market:ranking:acmlVolume" // score: 누적 거래량
+	zsetChangeRate = "market:ranking:todayChangeRate" // 등락률(%)
+	zsetBuyVolume  = "market:ranking:todayBuyVolume"  // 금일 매수 체결량
+	zsetAcmlVolume     = "market:ranking:acmlVolume" // 누적 거래량
 )
 
 type StockInfo struct {

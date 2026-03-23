@@ -1,4 +1,3 @@
-// Package kafka provides Kafka infrastructure for the order-matching domain.
 package kafka
 
 import (

@@ -159,7 +159,7 @@ func (c *ExternalMarketClient) connect(ctx context.Context) {
 													c.log.Warn("Standard Ping failed", zap.Error(err))
 													return
 						}
-						case <-ctx.Done(): // 연결이 끊기거나 cancel되면 종료
+						case <-ctx.Done():
                 return
             case <-c.stopCh:
                 return

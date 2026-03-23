@@ -8,11 +8,11 @@ import (
 	pnlapp "barleyssal-go/domains/pnl/application"
 	httphandler "barleyssal-go/interfaces/http"
 	kisauth "barleyssal-go/shared/infrastructure/kis_auth"
+	kisrest "barleyssal-go/shared/infrastructure/kis_rest"
 	wshub "barleyssal-go/shared/infrastructure/websocket"
 	"barleyssal-go/shared/price"
 	"barleyssal-go/shared/ratelimit"
 	"barleyssal-go/shared/session"
-	"barleyssal-go/shared/utils"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -75,7 +75,7 @@ func main() {
 
 	matchEng := matchingapp.New(cfg, rdb, execProducer, hub, log)
 
-	kisRestClient := utils.NewKisRestClient(log)
+	kisRestClient := kisrest.NewKisRestClient(log)
 	chartSvc := chartapp.New(cfg, rdb, authSvc, kisRestClient, hub, log)
 
 	priceSvc := price.New(cfg, rdb, chartSvc, matchEng, pnlSvc, log)

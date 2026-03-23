@@ -11,6 +11,7 @@ import (
 
 	"barleyssal-go/config"
 	kisauth "barleyssal-go/shared/infrastructure/kis_auth"
+	kisrest "barleyssal-go/shared/infrastructure/kis_rest"
 	"barleyssal-go/shared/ports"
 	"barleyssal-go/shared/utils"
 
@@ -59,7 +60,7 @@ type ChartService struct {
 	cfg        *config.Config
 	rdb        *redis.Client
 	authSvc    *kisauth.KisAuthService
-	restClient *utils.KisRestClient
+	restClient *kisrest.KisRestClient
 	log        *zap.Logger
 	notifier ports.UserNotifier
 
@@ -71,7 +72,7 @@ func New(
 	cfg *config.Config,
 	rdb *redis.Client,
 	authSvc *kisauth.KisAuthService,
-	restClient *utils.KisRestClient,
+	restClient *kisrest.KisRestClient,
 	notifier ports.UserNotifier,
 	log *zap.Logger,
 ) *ChartService {

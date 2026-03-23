@@ -56,17 +56,17 @@ func Load() *Config {
 			}
 
 	return &Config{
-		Port: parseInt(os.Getenv("PORT"), 4000),
+		Port: parseInt(os.Getenv("GO_PORT"), 4000),
 
 		Redis: RedisConfig{
-			Host:     envStr("REDIS_HOST", "localhost"),
+			Host:     envStr("REDIS_HOST_NAME", "redis-service"),
 			Port:     parseInt(os.Getenv("REDIS_PORT"), 6379),
 			Password: os.Getenv("REDIS_PASSWORD"),
 			DB:       parseInt(os.Getenv("REDIS_DB"), 1),
 		},
 
 		Kafka: KafkaConfig{
-			Brokers:  strings.Split(envStr("KAFKA_BROKERS", "localhost:9092"), ","),
+			Brokers:  strings.Split(envStr("KAFKA_BOOTSTRAP_SERVERS", "kafka-service:9092"), ","),
 			ClientID: "barleyssal-go-market",
 		},
 
@@ -85,7 +85,7 @@ func Load() *Config {
 			InfoTTL: parseInt(os.Getenv("INFO_CACHE_TTL"), 604800),
 		},
 
-		CorsOrigin: envStr("CORS_ORIGIN", "http://localhost:5173"),
+		CorsOrigin: envStr("FRONT_BASE_URL", "https://barleyssal.vercel.app"),
 
 	}
 }
