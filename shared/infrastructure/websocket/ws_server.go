@@ -52,8 +52,6 @@ type Hub struct {
 	connCount int64
 }
 
-
-
 func NewHub(log *zap.Logger, 	cfg *config.Config, sessionRes *session.Resolver) *Hub {
 	return &Hub{
 		log: log,

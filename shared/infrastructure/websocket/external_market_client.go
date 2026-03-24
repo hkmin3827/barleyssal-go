@@ -250,17 +250,19 @@ func (c *ExternalMarketClient) checkAndToggle(ctx context.Context, loc *time.Loc
 }
 
 func (c *ExternalMarketClient) sendSubscriptions(conn *websocket.Conn, trType string) {
-    key := c.authSvc.GetApprovalKey()
-    if key == "" {
-        c.log.Error("Approval Key 없음 - KIS 구독 중단")
-        return
-    }
-    for _, code := range c.watchList {
-        time.Sleep(50 * time.Millisecond)
-        _ = c.safeWrite(conn, websocket.TextMessage, c.buildMsg(key, code, trType))
-    }
+	key := c.authSvc.GetApprovalKey()
+	if key == "" {
+		c.log.Error("Approval Key 없음 - KIS 구독 중단")
+		return
+	}
+	for _, code := range c.watchList {
+		time.Sleep(50 * time.Millisecond)
+		if err := c.safeWrite(conn, websocket.TextMessage,
+			c.buildMsg(key, code, trType)); err != nil {
+				c.log.Error("KIS 구독 전송 실패", zap.String("code", code),  zap.Error(err))
+		}
+	}
 }
-
 
 func (c *ExternalMarketClient) buildMsg(approvalKey, code, trType string) []byte {
 	b, _ := json.Marshal(map[string]interface{}{
@@ -283,6 +285,8 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 			if hdr, ok := j["header"].(map[string]interface{}); ok {
 				if hdr["tr_id"] == "PINGPONG" {
 					_ = c.safeWrite(conn, websocket.TextMessage, []byte(raw))
+				} else {
+					c.log.Info("KIS 구독 응답 수신", zap.String("raw", raw))
 				}
 			}
 		}
@@ -339,7 +343,17 @@ func (c *ExternalMarketClient) handleMessage(ctx context.Context, raw string, co
 
 	prdyVrssSignInt := parseInt64(prdyVrssSign)
 
-	
+	// c.log.Debug("KIS 틱 수신",
+	// 	zap.String("code", stockCode),
+	// 	zap.Float64("price", price),
+	// 	zap.Float64("changeRate", changeRate),
+	// 	zap.Int64("acmlVol", acmlVol),
+	// 	zap.Float64("cntgVol", cntgVol),
+	// 	zap.String("kisTime", kisTimeStr),
+	// 	zap.String("mkopCode", mkopCode),
+	// 	zap.String("rawFields", parts[3]),
+	// )
+
 	liveBar, err := c.priceHook.OnPriceUpdate(ctx, stockCode, price, changeRate, int64(cntgVol), prdyVrssSignInt ,prdyVrss, stckOprc, stckHgpr, stckLwpr, acmlVol, utcTime, mkopCode)
 
 	if err != nil {

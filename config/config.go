@@ -53,13 +53,13 @@ func Load() *Config {
 	err := godotenv.Load()
 	if err != nil {
 					fmt.Println("Info: .env file not found, using system environment variables")
-			}
+	}
 
 	return &Config{
 		Port: parseInt(os.Getenv("GO_PORT"), 4000),
 
 		Redis: RedisConfig{
-			Host:     envStr("REDIS_HOST_NAME", "redis-service"),
+			Host:     envStr("REDIS_HOST_NAME", "localhost"),
 			Port:     parseInt(os.Getenv("REDIS_PORT"), 6379),
 			Password: os.Getenv("REDIS_PASSWORD"),
 			DB:       parseInt(os.Getenv("REDIS_DB"), 1),
@@ -85,7 +85,7 @@ func Load() *Config {
 			InfoTTL: parseInt(os.Getenv("INFO_CACHE_TTL"), 604800),
 		},
 
-		CorsOrigin: envStr("FRONT_BASE_URL", "https://barleyssal.vercel.app"),
+		CorsOrigin: envStr("CORS_ORIGIN", "http://localhost:5173"),
 
 	}
 }

@@ -35,7 +35,6 @@ func main() {
 
 	cfg := config.Load()
 
-	// 레디스
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
 		Password: cfg.Redis.Password,
@@ -55,13 +54,11 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// KIS AUTH
 	authSvc := kisauth.New(cfg, rdb, log)
 	if err := authSvc.InitKisAuth(ctx); err != nil {
 		log.Error("Failed to initialize KIS Auth – API calls may fail", zap.Error(err))
 	}
 
-	// 카프카
 	execProducer := orderkafka.NewExecutionProducer(cfg, log)
 	if err := execProducer.Connect(ctx); err != nil {
 		log.Error("Kafka producer connection failed – executions will not work", zap.Error(err))
@@ -80,13 +77,11 @@ func main() {
 
 	priceSvc := price.New(cfg, rdb, chartSvc, matchEng, pnlSvc, log)
 
-	// 레디스에 stock 종목 등록 (이미 있는 값은 패스)
 	watchCodes := config.WatchList(40)
 	if err := priceSvc.RegisterStocks(ctx, watchCodes); err != nil {
 		log.Warn("registerStocks failed", zap.Error(err))
 	}
 	
-	// 카프카 컨슈머
 	orderConsumer := orderkafka.NewOrderConsumer(cfg, func(ctx context.Context, ev orderkafka.OrderRequestEvent) error {
 		return matchEng.OnOrderReceived(ctx, matchingapp.OrderEvent{
 			OrderID:    ev.OrderID,
@@ -104,7 +99,6 @@ func main() {
 	cancelCtx, cancelFn := context.WithCancel(ctx)
 	orderConsumer.Start(cancelCtx)
 
-	// KIS ws 클라이언트
 	extClient := wshub.NewExternalMarketClient(
 		cfg.External.WsURL,
 		watchCodes,
@@ -116,6 +110,10 @@ func main() {
 	)
 
 	go extClient.RunScheduler(cancelCtx)
+
+// 	chartSvc.StartFlusher(cancelCtx)
+// 	mockTicker := wshub.NewMockMarketTicker(priceSvc, hub, watchCodes, 500*time.Millisecond, log)
+// go mockTicker.Start(cancelCtx)
 
 go func() {
 	log.Info("실시간 랭킹 스케쥴러 티커 활동")

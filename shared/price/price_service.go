@@ -90,23 +90,24 @@ func (s *PriceService) OnPriceUpdate(
 
 	priceStr := strconv.FormatFloat(price, 'f', -1, 64) 
 
+	infoFields := map[string]interface{}{
+	"price":        price,
+	"changeRate":   changeRate,
+	"prdyVrssSign": prdyVrssSign,
+	"prdyVrss":     prdyVrss,  // 전일 대비 (원)
+	"stckOprc":     stckOprc,  // 시가
+	"stckHgpr":     stckHgpr,  // 고가
+	"stckLwpr":     stckLwpr,  // 저가
+	"acmlVol":      acmlVol,   // 누적 거래량
+	"volume":       volume,    // 단일 체결량 (chartSvc 호환 유지)
+	"mKopCode":     mkopCode,  // 신 장운영 구분 코드
+	}
+
 	pipe.Set(ctx, priceKey(stockCode), priceStr, time.Duration(s.cfg.Cache.PriceTTL)*time.Second)
 
 
-	pipe.HSet(ctx, infoKey(stockCode), map[string]interface{}{
-		"price":      price,
-		"changeRate": changeRate,
-		"prdyVrssSign": prdyVrssSign,
-		"prdyVrss":   prdyVrss,    // 전일 대비 (원)
-		"stckOprc":   stckOprc,    // 시가
-		"stckHgpr":   stckHgpr,    // 고가
-		"stckLwpr":   stckLwpr,    // 저가
-		"acmlVol":    acmlVol,     // 누적 거래량
-		"volume":     volume,      // 단일 체결량 (chartSvc 호환 유지)
-		"mKopCode":   mkopCode,    // 신 장운영 구분 코드
-	})
+	pipe.HSet(ctx, infoKey(stockCode), infoFields)
 	pipe.Expire(ctx, infoKey(stockCode), time.Duration(s.cfg.Cache.InfoTTL)*time.Second)
-
 
 	pipe.ZAdd(ctx, zsetChangeRate, redis.Z{Score: changeRate, Member: stockCode})
 	pipe.ZAdd(ctx, zsetAcmlVolume, redis.Z{Score: float64(acmlVol), Member: stockCode})
@@ -115,7 +116,20 @@ func (s *PriceService) OnPriceUpdate(
 	
 	if _, err := pipe.Exec(ctx); err != nil {
 		s.log.Warn("price pipeline exec failed", zap.String("code", stockCode), zap.Error(err))
-		return ports.BarEvent{}, err
+		fbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		fbPipe := s.rdb.Pipeline()
+    fbPipe.Set(ctx, priceKey(stockCode), priceStr, time.Duration(s.cfg.Cache.PriceTTL)*time.Second)
+    fbPipe.HSet(ctx, infoKey(stockCode), infoFields)
+		fbPipe.Expire(fbCtx, infoKey(stockCode), time.Duration(s.cfg.Cache.InfoTTL)*time.Second)
+    if _, fbErr := fbPipe.Exec(fbCtx); fbErr != nil {
+			s.log.Error("fallback 저장도 실패 — Redis 연결 확인 ‼️",
+				zap.String("code", stockCode), zap.Error(fbErr))
+		} else {
+			s.log.Info("fallback 저장 성공", zap.String("code", stockCode), zap.Float64("price", price))
+		}
+		
+    return liveBar, err 
 	}
 
 	if err := s.matchEng.CheckLimitOrders(ctx, stockCode, priceStr); err != nil {
