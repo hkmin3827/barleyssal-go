@@ -97,6 +97,9 @@ func main() {
 	}, log)
 
 	cancelCtx, cancelFn := context.WithCancel(ctx)
+
+	chartSvc.StartFlusher(cancelCtx)
+	
 	orderConsumer.Start(cancelCtx)
 
 	extClient := wshub.NewExternalMarketClient(
@@ -111,7 +114,6 @@ func main() {
 
 	go extClient.RunScheduler(cancelCtx)
 
-// 	chartSvc.StartFlusher(cancelCtx)
 // 	mockTicker := wshub.NewMockMarketTicker(priceSvc, hub, watchCodes, 500*time.Millisecond, log)
 // go mockTicker.Start(cancelCtx)
 

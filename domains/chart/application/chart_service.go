@@ -52,8 +52,8 @@ type barBuf struct {
 	high   float64
 	low    float64
 	close  float64
-	volume float64 
-	minute string  // YYYYMMDDHHmm (UTC)
+	volume float64
+	minute string // YYYYMMDDHHmm (UTC)
 }
 
 type ChartService struct {
@@ -62,10 +62,10 @@ type ChartService struct {
 	authSvc    *kisauth.KisAuthService
 	restClient *kisrest.KisRestClient
 	log        *zap.Logger
-	notifier ports.UserNotifier
+	notifier   ports.UserNotifier
 
 	mu     sync.Mutex
-	buffer map[string]*barBuf 
+	buffer map[string]*barBuf
 }
 
 func New(
@@ -81,7 +81,7 @@ func New(
 		rdb:        rdb,
 		authSvc:    authSvc,
 		restClient: restClient,
-		notifier: notifier,
+		notifier:   notifier,
 		log:        log,
 		buffer:     make(map[string]*barBuf),
 	}
@@ -90,25 +90,37 @@ func New(
 func (s *ChartService) UpdateOhlcvBuffer(ctx context.Context, code string, price, cntgVol float64, pipe redis.Pipeliner, eventTime time.Time) ports.BarEvent {
 	minute := utils.BuildMinuteKey(eventTime)
 
-	snapshot := s.applyTick(ctx, code, price, cntgVol, minute, pipe)
+	snapshot, completedBar := s.applyTick(code, price, cntgVol, minute)
+
+	if completedBar != nil {
+		s.enqueueBar(ctx, code, completedBar, pipe)
+		if s.notifier != nil {
+			s.notifier.BroadcastBarComplete(code, ports.BarEvent{
+				T: completedBar.minute, O: completedBar.open, H: completedBar.high,
+				L: completedBar.low, C: completedBar.close, V: completedBar.volume,
+			})
+		}
+	}
 
 	bar := ports.BarEvent{T: snapshot.minute, O: snapshot.open, H: snapshot.high, L: snapshot.low, C: snapshot.close, V: snapshot.volume}
-  payload, _ := json.Marshal(bar)
-
+	payload, _ := json.Marshal(bar)
 	pipe.Set(ctx, "market:ohlcv:live:"+code, string(payload), 2*time.Minute)
 
 	return bar
 }
 
-func (s *ChartService) applyTick(ctx context.Context, code string, price, cntgVol float64, minute string, pipe redis.Pipeliner) barBuf {
+func (s *ChartService) applyTick(code string, price, cntgVol float64, minute string) (barBuf, *barBuf) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	bar, exists := s.buffer[code]
 
+	var completed *barBuf
+
 	if !exists || bar.minute != minute {
 		if exists && bar != nil {
-			s.pushCompletedBar(ctx, code, bar, pipe)
+			copy := *bar
+			completed = &copy
 		}
 		bar = &barBuf{
 			open:   price,
@@ -129,15 +141,16 @@ func (s *ChartService) applyTick(ctx context.Context, code string, price, cntgVo
 		bar.close = price
 	}
 
-	bar.volume += cntgVol // 단일 체결량(cntgVol)만 누적!
+	bar.volume += cntgVol
 
-	return *bar 
+	return *bar, completed
 }
 
 func (s *ChartService) StartFlusher(ctx context.Context) {
 	go func() {
 		now := time.Now().UTC()
 		nextMinute := now.Truncate(time.Minute).Add(time.Minute)
+
 		select {
 		case <-time.After(time.Until(nextMinute)):
 		case <-ctx.Done():
@@ -157,7 +170,7 @@ func (s *ChartService) StartFlusher(ctx context.Context) {
 			}
 		}
 	}()
-	s.log.Info("OHLCV 주기적 플러셔 시작 (KIS WS 연결 연동)")
+	s.log.Info("OHLCV 주기적 플러셔 시작 (서버 생명주기에 고정)")
 }
 
 func (s *ChartService) flushExpiredBars(ctx context.Context) {
@@ -167,7 +180,8 @@ func (s *ChartService) flushExpiredBars(ctx context.Context) {
 	toFlush := make(map[string]*barBuf)
 	for code, bar := range s.buffer {
 		if bar.minute < currentMinute {
-			toFlush[code] = bar
+			copy := *bar
+			toFlush[code] = &copy
 			delete(s.buffer, code)
 		}
 	}
@@ -179,16 +193,27 @@ func (s *ChartService) flushExpiredBars(ctx context.Context) {
 
 	pipe := s.rdb.Pipeline()
 	for code, bar := range toFlush {
-		s.pushCompletedBar(ctx, code, bar, pipe)
+		s.enqueueBar(ctx, code, bar, pipe)
 	}
+
 	if _, err := pipe.Exec(ctx); err != nil {
 		s.log.Warn("flushExpiredBars pipeline 실패", zap.Error(err))
 		return
 	}
+
 	s.log.Info("OHLCV 주기 플러시 완료", zap.Int("codes", len(toFlush)), zap.String("minute", currentMinute))
+
+	if s.notifier != nil {
+		for code, bar := range toFlush {
+			s.notifier.BroadcastBarComplete(code, ports.BarEvent{
+				T: bar.minute, O: bar.open, H: bar.high,
+				L: bar.low, C: bar.close, V: bar.volume,
+			})
+		}
+	}
 }
 
-func (s *ChartService) pushCompletedBar(ctx context.Context, code string, bar *barBuf, pipe redis.Pipeliner) {
+func (s *ChartService) enqueueBar(ctx context.Context, code string, bar *barBuf, pipe redis.Pipeliner) {
 	payload, err := json.Marshal(OhlcvBarJSON{
 		T: bar.minute,
 		O: bar.open,
@@ -204,15 +229,8 @@ func (s *ChartService) pushCompletedBar(ctx context.Context, code string, bar *b
 
 	key := "market:ohlcv:1m:" + code
 	pipe.LPush(ctx, key, string(payload))
-	pipe.LTrim(ctx, key, 0, 2999) 
+	pipe.LTrim(ctx, key, 0, 2999)
 	pipe.Expire(ctx, key, time.Duration(s.cfg.Cache.OhlcvTTL)*time.Second)
-
-	 if s.notifier != nil {
-        s.notifier.BroadcastBarComplete(code, ports.BarEvent{
-            T: bar.minute, O: bar.open, H: bar.high,
-            L: bar.low,  C: bar.close, V: bar.volume,
-        })
-    }
 }
 
 var minuteRegex = regexp.MustCompile(`^(\d+)m$`)
@@ -282,8 +300,8 @@ func aggregateBars(bars []OhlcvBarJSON, chunk int) []OhlcvBarJSON {
 			if b.L < cur.L {
 				cur.L = b.L
 			}
-			cur.C = b.C 
-			cur.V += b.V 
+			cur.C = b.C
+			cur.V += b.V
 			cnt++
 		}
 		if cnt == chunk {
@@ -324,7 +342,6 @@ func barTimeToMs(t string) int64 {
 	mi, _ := strconv.Atoi(t[10:12])
 	return time.Date(y, time.Month(mo), d, h, mi, 0, 0, time.UTC).UnixMilli()
 }
-
 
 func (s *ChartService) GetPeriodChartData(ctx context.Context, stockCode, period, startDate, endDate string) ([]ChartData, error) {
 	token, err := s.authSvc.GetAccessToken(ctx)
@@ -385,16 +402,14 @@ func (s *ChartService) GetPeriodChartData(ctx context.Context, stockCode, period
 		})
 	}
 
-	reverseSlice(list) 
+	reverseSlice(list)
 	return list, nil
 }
 
-
-
 func reverseSlice[T any](s []T) {
-    for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-        s[i], s[j] = s[j], s[i]
-    }
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
 }
 
 func strVal(m map[string]interface{}, key string) string {

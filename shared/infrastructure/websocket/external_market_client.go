@@ -79,15 +79,9 @@ func (c *ExternalMarketClient) Stop() {
 	c.stopping = true
 	conn := c.conn
 	c.conn = nil
-	flushCancel := c.flushCancel
-	c.flushCancel = nil
 	c.mu.Unlock()
 
 	close(c.stopCh)
-
-	if flushCancel != nil {
-		flushCancel()
-	}
 
 	if conn != nil {
 		c.sendSubscriptions(conn, "2")  
@@ -126,19 +120,7 @@ func (c *ExternalMarketClient) connect(ctx context.Context) {
 
 	c.log.Info("KIS WS 연결 성공")
 	go c.sendSubscriptions(conn, "1")  
-
-	if c.chartSvc != nil {
-		c.mu.Lock()
-		if c.flushCancel != nil {
-			c.flushCancel()
-		}
-		flushCtx, flushCancel := context.WithCancel(ctx)
-		c.flushCancel = flushCancel
-		c.mu.Unlock()
-		c.chartSvc.StartFlusher(flushCtx)
-	}
-
-	
+		
 	const pongWait = 30 * time.Second
 	const pingPeriod = 20 * time.Second  
 	
