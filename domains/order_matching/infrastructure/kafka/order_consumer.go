@@ -59,7 +59,7 @@ func NewOrderConsumer(cfg *config.Config, handler OrderHandler, log *zap.Logger)
 		GroupID:           "go-order-matcher",
 		MinBytes:          1,
 		MaxBytes:          1024 * 1024,
-		MaxWait:           500 * time.Millisecond,
+		MaxWait:           10 * time.Millisecond,
 		CommitInterval:    0,
 		StartOffset:       kfkgo.LastOffset,
 		SessionTimeout:    30 * time.Second,

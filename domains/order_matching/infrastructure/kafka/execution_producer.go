@@ -32,9 +32,12 @@ func NewExecutionProducer(cfg *config.Config, log *zap.Logger) *ExecutionProduce
 		Topic:                  executionTopic,
 		Balancer:               &kfkgo.LeastBytes{},
 		AllowAutoTopicCreation: false,
-		RequiredAcks:           kfkgo.RequireAll,
+		RequiredAcks:           kfkgo.RequireOne,
+		BatchTimeout: 10 * time.Millisecond,
+		BatchSize:    10,
+		WriteTimeout: 2 * time.Second,
 		MaxAttempts:            5,
-		WriteBackoffMin:        100 * time.Millisecond,
+		WriteBackoffMin:        50 * time.Millisecond,
 		WriteBackoffMax:        1 * time.Second,
 	}
 	return &ExecutionProducer{writer: w, log: log}

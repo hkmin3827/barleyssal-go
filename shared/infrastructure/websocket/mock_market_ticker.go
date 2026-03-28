@@ -107,7 +107,7 @@ func (m *MockMarketTicker) Start(ctx context.Context) {
 					newPrice,   // stckLwpr
 					acmlVolMap[code],
 					now,
-					"",
+					"20",
 				)
 				if err != nil {
 					m.log.Warn("MockTicker OnPriceUpdate 실패", zap.String("code", code), zap.Error(err))
@@ -132,7 +132,7 @@ func (m *MockMarketTicker) Start(ctx context.Context) {
 					"cttr":         50.0,
 					"selnCntgCsnu": float64(rand.Intn(10)),
 					"shnuCntgCsnu": float64(rand.Intn(10)),
-					"mkopCode":     "",
+					"mkopCode":     "20",
 					"shnuCntgSmtn": float64(cntgVol),
 					"ts":           now.UnixMilli(),
 					"ohlcv": map[string]interface{}{
